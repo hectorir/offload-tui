@@ -22,6 +22,34 @@ use std::sync::mpsc::{Receiver, Sender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+/// What happens to the original once its copy is verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Keep the original on the card.
+    #[default]
+    Copy,
+    /// Delete the original from the card right after its copy is verified (a "move").
+    Move,
+}
+
+impl Mode {
+    pub fn from_config(s: &str) -> Mode {
+        if s.eq_ignore_ascii_case("move") { Mode::Move } else { Mode::Copy }
+    }
+    pub fn toggled(self) -> Mode {
+        match self {
+            Mode::Copy => Mode::Move,
+            Mode::Move => Mode::Copy,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Copy => "copy",
+            Mode::Move => "move",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanItem {
     pub source: PathBuf,
@@ -39,6 +67,7 @@ pub struct Plan {
     /// Single camera: that camera's folder. Batch: the shared dated folder.
     pub dest_dir: PathBuf,
     pub items: Vec<PlanItem>,
+    pub mode: Mode,
 }
 
 impl Plan {
@@ -95,7 +124,7 @@ pub fn build_batch_plan(cfg: &Config, parts: &[BatchPart], now: chrono::DateTime
         }
     }
     let dest_dir = if parts.len() == 1 { profile_dest_dir(cfg, first.profile, &date) } else { cfg.dest_base_for(first.profile).join(&date) };
-    Ok(Plan { dest_dir, items })
+    Ok(Plan { dest_dir, items, mode: Mode::Copy })
 }
 
 /// Build the plan for a single profile: `<dest>/<date>/<subfolder>/`.
@@ -156,16 +185,27 @@ pub fn preflight(plan: &Plan) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// What happened to the original on the card (only relevant in move mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Removal {
+    NotRequested,
+    Removed,
+    /// The copy is safe, but the original could not be deleted (and was left alone).
+    Failed(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Copied and verified. `renamed` = a different file already had that name.
     Copied {
         dest: PathBuf,
         renamed: bool,
+        removed: Removal,
     },
     /// Identical file (same checksum) already at the destination.
     Skipped {
         dest: PathBuf,
+        removed: Removal,
     },
     Failed(String),
     Cancelled,
@@ -190,6 +230,9 @@ pub struct Summary {
     pub renamed: usize,
     pub bytes_copied: u64,
     pub failures: Vec<(String, String)>,
+    /// Move mode: originals deleted from the card, and ones that could not be.
+    pub moved: usize,
+    pub move_failures: Vec<(String, String)>,
     pub cancelled: bool,
     pub elapsed: Duration,
 }
@@ -231,17 +274,29 @@ struct Tally {
 }
 
 impl Tally {
+    fn count_removal(&mut self, name: &str, removed: &Removal) {
+        match removed {
+            Removal::Removed => self.summary.moved += 1,
+            Removal::Failed(why) => self.summary.move_failures.push((name.to_string(), why.clone())),
+            Removal::NotRequested => {}
+        }
+    }
+
     fn done(tally: &Mutex<Tally>, index: usize, name: &str, size: u64, outcome: Outcome) {
         let mut t = tally.lock().unwrap_or_else(|e| e.into_inner());
         match &outcome {
-            Outcome::Copied { renamed, .. } => {
+            Outcome::Copied { renamed, removed, .. } => {
                 t.summary.copied += 1;
                 t.summary.bytes_copied += size;
                 if *renamed {
                     t.summary.renamed += 1;
                 }
+                t.count_removal(name, removed);
             }
-            Outcome::Skipped { .. } => t.summary.skipped += 1,
+            Outcome::Skipped { removed, .. } => {
+                t.summary.skipped += 1;
+                t.count_removal(name, removed);
+            }
             Outcome::Failed(why) => {
                 t.summary.failed += 1;
                 t.summary.failures.push((name.to_string(), why.clone()));
@@ -262,11 +317,61 @@ struct VerifyJob {
     renamed: bool,
     name: String,
     size: u64,
+    source: PathBuf,
 }
 
 enum Resolved {
     Skip(PathBuf),
     Use { final_path: PathBuf, renamed: bool },
+}
+
+/// Delete one original from the card, but only if everything checks out:
+/// the verified copy is still at `dest` with the right size, and the original is a plain file that has not
+/// changed since it was scanned. On any doubt the original is left alone.
+pub fn remove_original(source: &Path, size: u64, modified: SystemTime, dest: &Path) -> std::result::Result<(), String> {
+    match fs::symlink_metadata(dest) {
+        Ok(m) if m.is_file() && m.len() == size => {}
+        Ok(_) => return Err("the copy on the destination has a different size; original kept".into()),
+        Err(_) => return Err("the copy is no longer on the destination; original kept".into()),
+    }
+    match fs::symlink_metadata(source) {
+        Ok(m) if m.is_file() && m.len() == size && m.modified().ok() == Some(modified) => {}
+        Ok(_) => return Err("the original changed since it was scanned; kept".into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Err("the original is already gone".into()),
+        Err(e) => return Err(format!("cannot inspect the original: {e}")),
+    }
+    fs::remove_file(source).map_err(|e| format!("could not delete the original: {e}"))
+}
+
+/// An original whose copy has been verified (candidate for deleting after the fact).
+#[derive(Debug, Clone)]
+pub struct Original {
+    pub source: PathBuf,
+    pub size: u64,
+    pub modified: SystemTime,
+    pub dest: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct DeleteReport {
+    pub deleted: usize,
+    pub bytes: u64,
+    pub failures: Vec<(String, String)>,
+}
+
+/// Delete verified originals, each with the same safety checks as a move.
+pub fn delete_originals(list: &[Original]) -> DeleteReport {
+    let mut rep = DeleteReport::default();
+    for o in list {
+        match remove_original(&o.source, o.size, o.modified, &o.dest) {
+            Ok(()) => {
+                rep.deleted += 1;
+                rep.bytes += o.size;
+            }
+            Err(e) => rep.failures.push((o.source.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), e)),
+        }
+    }
+    rep
 }
 
 fn candidate_name(name: &str, n: u32) -> String {
@@ -318,6 +423,13 @@ fn resolve_dest(dest_dir: &Path, item: &PlanItem, reserved: &mut HashSet<String>
         }
     }
     Err(io::Error::other("could not find a free destination name"))
+}
+
+fn removal(r: std::result::Result<(), String>) -> Removal {
+    match r {
+        Ok(()) => Removal::Removed,
+        Err(e) => Removal::Failed(e),
+    }
 }
 
 fn part_path(final_path: &Path) -> PathBuf {
@@ -454,6 +566,7 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
         let vt = tally.clone();
         let vctrl = ctrl.clone();
         let vevents = tx.clone();
+        let mode = plan.mode;
         s.spawn(move || {
             while let Ok(job) = vrx.recv() {
                 let _ = vevents.send(Event::Verifying { index: job.index });
@@ -463,7 +576,14 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
                     continue;
                 }
                 match verify_job(&job, &vctrl, &vevents) {
-                    Ok(()) => Tally::done(&vt, job.index, &job.name, job.size, Outcome::Copied { dest: job.final_path.clone(), renamed: job.renamed }),
+                    Ok(()) => {
+                        let removed = if mode == Mode::Move {
+                            removal(remove_original(&job.source, job.size, job.modified, &job.final_path))
+                        } else {
+                            Removal::NotRequested
+                        };
+                        Tally::done(&vt, job.index, &job.name, job.size, Outcome::Copied { dest: job.final_path.clone(), renamed: job.renamed, removed })
+                    }
                     Err(e) if e == "cancelled" => {
                         let _ = fs::remove_file(&job.part);
                         Tally::done(&vt, job.index, &job.name, job.size, Outcome::Cancelled);
@@ -491,7 +611,9 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
                 Ok(Resolved::Skip(dest)) => {
                     let _ = tx.send(Event::Progress { index, bytes: item.size });
                     let _ = tx.send(Event::VerifyProgress { index, bytes: item.size });
-                    Tally::done(&tally, index, &item.name, item.size, Outcome::Skipped { dest });
+                    let removed =
+                        if plan.mode == Mode::Move { removal(remove_original(&item.source, item.size, item.modified, &dest)) } else { Removal::NotRequested };
+                    Tally::done(&tally, index, &item.name, item.size, Outcome::Skipped { dest, removed });
                     continue;
                 }
                 Ok(Resolved::Use { final_path, renamed }) => (final_path, renamed),
@@ -515,6 +637,7 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
                         renamed,
                         name: item.name.clone(),
                         size: item.size,
+                        source: item.source.clone(),
                     };
                     if vtx.send(job).is_err() {
                         Tally::done(&tally, index, &item.name, item.size, Outcome::Failed("verifier stopped unexpectedly".into()));
@@ -590,6 +713,7 @@ mod verify_tests {
             renamed: false,
             name: "x.mp4".into(),
             size: written,
+            source: PathBuf::new(),
         }
     }
 
@@ -628,5 +752,105 @@ mod verify_tests {
         std::fs::write(d.path().join("x.mp4"), b"other").unwrap();
         assert!(verify_job(&j, &Control::default(), &tx).is_err());
         assert_eq!(std::fs::read(d.path().join("x.mp4")).unwrap(), b"other");
+    }
+}
+
+#[cfg(test)]
+mod removal_tests {
+    use super::*;
+
+    struct Fx {
+        _d: tempfile::TempDir,
+        src: PathBuf,
+        dest: PathBuf,
+        mtime: SystemTime,
+    }
+
+    fn fx() -> Fx {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("card.mp4");
+        let dest = d.path().join("backup.mp4");
+        std::fs::write(&src, b"footage!").unwrap();
+        std::fs::write(&dest, b"footage!").unwrap();
+        let mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+        Fx { _d: d, src, dest, mtime }
+    }
+
+    #[test]
+    fn deletes_when_everything_checks_out() {
+        let f = fx();
+        remove_original(&f.src, 8, f.mtime, &f.dest).unwrap();
+        assert!(!f.src.exists());
+        assert!(f.dest.exists(), "the backup is never touched");
+    }
+
+    #[test]
+    fn keeps_original_if_the_copy_is_missing_or_wrong_size() {
+        let f = fx();
+        std::fs::remove_file(&f.dest).unwrap();
+        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("no longer on the destination"));
+        assert!(f.src.exists());
+        std::fs::write(&f.dest, b"short").unwrap();
+        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("different size"));
+        assert!(f.src.exists());
+    }
+
+    #[test]
+    fn keeps_original_if_it_changed_since_the_scan() {
+        let f = fx();
+        // different mtime
+        let later = f.mtime + Duration::from_secs(5);
+        assert!(remove_original(&f.src, 8, later, &f.dest).unwrap_err().contains("changed"));
+        // different size
+        std::fs::write(&f.src, b"footage!!!").unwrap();
+        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("changed"));
+        assert!(f.src.exists());
+    }
+
+    #[test]
+    fn never_deletes_through_a_symlink() {
+        let f = fx();
+        let link = f.src.with_file_name("link.mp4");
+        std::os::unix::fs::symlink(&f.src, &link).unwrap();
+        assert!(remove_original(&link, 8, f.mtime, &f.dest).is_err());
+        assert!(f.src.exists() && link.exists());
+        // and a symlinked "copy" doesn't count as a backup
+        let dlink = f.dest.with_file_name("dlink.mp4");
+        std::os::unix::fs::symlink(&f.dest, &dlink).unwrap();
+        assert!(remove_original(&f.src, 8, f.mtime, &dlink).is_err());
+        assert!(f.src.exists());
+    }
+
+    #[test]
+    fn already_gone_is_reported_not_fatal() {
+        let f = fx();
+        std::fs::remove_file(&f.src).unwrap();
+        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("already gone"));
+    }
+
+    #[test]
+    fn delete_originals_reports_each_outcome() {
+        let f = fx();
+        let d2 = f.src.with_file_name("two.mp4");
+        std::fs::write(&d2, b"zzzz").unwrap();
+        let m2 = std::fs::metadata(&d2).unwrap().modified().unwrap();
+        let list = vec![
+            Original { source: f.src.clone(), size: 8, modified: f.mtime, dest: f.dest.clone() },
+            Original { source: d2.clone(), size: 4, modified: m2, dest: f.src.with_file_name("no-copy.mp4") }, // copy missing
+        ];
+        let rep = delete_originals(&list);
+        assert_eq!((rep.deleted, rep.bytes, rep.failures.len()), (1, 8, 1));
+        assert!(!f.src.exists());
+        assert!(d2.exists(), "the original with no verified copy survives");
+        assert_eq!(rep.failures[0].0, "two.mp4");
+    }
+
+    #[test]
+    fn mode_helpers() {
+        assert_eq!(Mode::from_config("MOVE"), Mode::Move);
+        assert_eq!(Mode::from_config("copy"), Mode::Copy);
+        assert_eq!(Mode::from_config("whatever"), Mode::Copy, "unknown values never default to deleting");
+        assert_eq!(Mode::Copy.toggled(), Mode::Move);
+        assert_eq!(Mode::default(), Mode::Copy);
     }
 }

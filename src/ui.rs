@@ -1,6 +1,7 @@
 //! Rendering. Pure functions of `App` state (plus recording click targets).
 
 use crate::app::*;
+use crate::engine::{Mode, Removal};
 use crate::fsutil::{human_bytes, human_duration, human_rate, sanitize_display, volume_root};
 use crate::theme::Theme;
 use crate::widgets::{self, WORDMARK, gradient_bar, solid_bar, spinner};
@@ -104,7 +105,25 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             hints(t, &h)
         }
         Screen::Scanning => hints(t, &[("esc", "cancel")]),
-        Screen::Review => hints(t, &[("space", "toggle"), ("a", "all/none"), ("tab", "dates"), ("enter", "copy"), ("esc", "back"), ("?", "help")]),
+        Screen::Review => match &app.review {
+            Some(rv) if rv.confirm_move => Line::from(Span::styled(
+                "Move = delete originals after verifying.  y = start   any other key = back",
+                Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+            )),
+            Some(rv) => hints(
+                t,
+                &[
+                    ("space", "toggle"),
+                    ("a", "all/none"),
+                    ("tab", "dates"),
+                    ("m", if rv.mode == Mode::Move { "mode: MOVE" } else { "mode: copy" }),
+                    ("enter", "go"),
+                    ("esc", "back"),
+                    ("?", "help"),
+                ],
+            ),
+            None => Line::from(""),
+        },
         Screen::Running => match &app.run {
             Some(r) if r.confirm_cancel => Line::from(Span::styled(
                 "Cancel and discard unfinished files?  y = yes   any other key = keep going",
@@ -120,8 +139,23 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     format!("Eject {}?  y = yes   any other key = no", names.join(", ")),
                     Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
                 ))
+            } else if app.delete_confirm {
+                let bytes: u64 = app.originals.iter().map(|o| o.size).sum();
+                Line::from(Span::styled(
+                    format!(
+                        "PERMANENTLY delete {} originals ({}) from the card? Cannot be undone.  y = delete   any other key = keep",
+                        app.originals.len(),
+                        human_bytes(bytes)
+                    ),
+                    Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+                ))
             } else {
-                hints(t, &[("o", "open folder"), ("x", "eject card"), ("s", "stats"), ("enter", "home"), ("q", "quit")])
+                let mut h = vec![("o", "open folder")];
+                if app.run_mode == Mode::Copy && !app.originals.is_empty() && app.deleted.is_none() {
+                    h.push(("d", "delete originals"));
+                }
+                h.extend([("x", "eject card"), ("s", "stats"), ("enter", "home"), ("q", "quit")]);
+                hints(t, &h)
             }
         }
         Screen::Config => {
@@ -473,7 +507,7 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     let n_types = rv.scan.by_ext().len() as u16;
     let cams_h = if rv.is_batch() { rv.profiles.len() as u16 + 2 } else { 0 };
     let [sum_a, cams_a, src_a, typ_a, date_a] = Layout::vertical([
-        Constraint::Length(8),
+        Constraint::Length(9),
         Constraint::Length(cams_h),
         Constraint::Length(n_src + 2),
         Constraint::Length(n_types.max(1) + 2),
@@ -501,14 +535,34 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         ]),
         storage_line(&t, "backup", &rv.dest, si.width as usize),
     ];
-    if let Some(e) = &rv.error {
+    sl.push(Line::from(match rv.mode {
+        Mode::Copy => vec![
+            Span::styled("mode      ", dim(&t)),
+            Span::styled("COPY", bold(&t)),
+            Span::styled(" · originals stay on the card", dim(&t)),
+            Span::styled("  (m)", dim(&t)),
+        ],
+        Mode::Move => vec![
+            Span::styled("mode      ", dim(&t)),
+            Span::styled("MOVE", Style::default().fg(t.warn).add_modifier(Modifier::BOLD)),
+            Span::styled(" · originals deleted once verified", Style::default().fg(t.warn)),
+            Span::styled("  (m)", dim(&t)),
+        ],
+    }));
+    if rv.confirm_move {
+        sl.push(Line::from(Span::styled(
+            "⚠ MOVE deletes each original from the card right after its copy is verified.  y = start moving · any other key = back",
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        )));
+    } else if let Some(e) = &rv.error {
         sl.push(Line::from(Span::styled(format!("⚠ {e}"), Style::default().fg(t.err).add_modifier(Modifier::BOLD))));
     } else if !rv.dest.mounted {
         sl.push(Line::from(Span::styled("⚠ backup drive not mounted", Style::default().fg(t.err))));
     } else if !rv.enough_space() {
         sl.push(Line::from(Span::styled("⚠ not enough free space", Style::default().fg(t.err))));
     } else {
-        sl.push(Line::from(Span::styled("press enter to copy + verify", Style::default().fg(t.ok))));
+        let go = if rv.mode == Mode::Move { "press enter to move (copy + verify + delete original)" } else { "press enter to copy + verify" };
+        sl.push(Line::from(Span::styled(go, Style::default().fg(t.ok))));
     }
     f.render_widget(Paragraph::new(sl).wrap(Wrap { trim: true }), si);
 
@@ -622,11 +676,26 @@ fn state_cells<'a>(t: &Theme, st: &ItemState, size: u64, frame: usize, w: usize)
             v.push(Span::styled(format!(" verifying {:>3.0}%", r * 100.0), Style::default().fg(t.accent2)));
             (Span::styled(spinner(frame), Style::default().fg(t.accent2)), v)
         }
-        ItemState::Copied { renamed } => (
-            Span::styled("✓", Style::default().fg(t.ok)),
-            vec![Span::styled(if *renamed { "verified · kept both (renamed)" } else { "verified" }, Style::default().fg(if *renamed { t.warn } else { t.ok }))],
-        ),
-        ItemState::Skipped => (Span::styled("↷", dim(t)), vec![Span::styled("already on destination (checksum match)", dim(t))]),
+        ItemState::Copied { renamed, removal } => {
+            let (text, c) = match (removal, renamed) {
+                (Removal::Removed, _) => ("verified · moved (original deleted)".to_string(), t.ok),
+                (Removal::Failed(e), _) => (format!("verified, but original NOT deleted: {}", trunc(&sanitize_display(e), 50)), t.warn),
+                (_, true) => ("verified · kept both (renamed)".to_string(), t.warn),
+                _ => ("verified".to_string(), t.ok),
+            };
+            (
+                Span::styled("✓", Style::default().fg(if matches!(removal, Removal::Failed(_)) { t.warn } else { t.ok })),
+                vec![Span::styled(text, Style::default().fg(c))],
+            )
+        }
+        ItemState::Skipped { removal } => {
+            let (text, c) = match removal {
+                Removal::Removed => ("already on destination · original deleted".to_string(), t.ok),
+                Removal::Failed(e) => (format!("already there, but original NOT deleted: {}", trunc(&sanitize_display(e), 40)), t.warn),
+                Removal::NotRequested => ("already on destination (checksum match)".to_string(), t.dim),
+            };
+            (Span::styled("↷", dim(t)), vec![Span::styled(text, Style::default().fg(c))])
+        }
         ItemState::Failed(e) => {
             (Span::styled("✗", Style::default().fg(t.err)), vec![Span::styled(trunc(&sanitize_display(e), 60), Style::default().fg(t.err))])
         }
@@ -653,7 +722,7 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
     } else if copy_done {
         ("VERIFYING", t.accent2)
     } else {
-        ("COPYING", t.accent)
+        (if run.mode == Mode::Move { "MOVING" } else { "COPYING" }, t.accent)
     };
     let top_h = 6 + if batch { run.profiles.len().min(4) as u16 } else { 0 };
     let [top, mid, list_a] = Layout::vertical([Constraint::Length(top_h), Constraint::Length(5), Constraint::Min(4)]).areas(area);
@@ -707,7 +776,7 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
                 files += 1;
                 total += item.size;
                 done += match st {
-                    ItemState::Copied { .. } | ItemState::Skipped | ItemState::Failed(_) => item.size as f64,
+                    ItemState::Copied { .. } | ItemState::Skipped { .. } | ItemState::Failed(_) => item.size as f64,
                     ItemState::Copying(b) => *b as f64 / 2.0,
                     ItemState::Verifying(b) => item.size as f64 / 2.0 + *b as f64 / 2.0,
                     _ => 0.0,
@@ -805,7 +874,7 @@ fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
         ("✓", "All files copied and verified", t.ok)
     };
     let w = area.width.min(90);
-    let h = (14 + s.failures.len().min(8) as u16 + if batch { pids.len() as u16 + 1 } else { 0 }).min(area.height);
+    let h = (16 + s.failures.len().min(8) as u16 + s.move_failures.len().min(6) as u16 + if batch { pids.len() as u16 + 1 } else { 0 }).min(area.height);
     let a = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(h) / 3, width: w, height: h };
     let blk = Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(c)).title(title(&t, &pname));
     let inner = blk.inner(a);
@@ -856,7 +925,48 @@ fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
     }
     if s.failed == 0 && !s.cancelled {
         lines.push(Line::from(Span::styled("Every copied file was re-read from disk and matched its source checksum.", dim(&t))));
-        lines.push(Line::from(Span::styled("Nothing was deleted from the card.", dim(&t))));
+    }
+    match (app.run_mode, &app.deleted) {
+        (Mode::Move, _) => {
+            lines.push(Line::from(vec![Span::styled("originals  ", dim(&t)), Span::styled(format!("{} deleted from the card (moved)", s.moved), bold(&t))]));
+            for (n, e) in s.move_failures.iter().take(6) {
+                lines.push(Line::from(vec![
+                    Span::styled("⚠ ", Style::default().fg(t.warn)),
+                    Span::styled(format!("{}: ", trunc(&sanitize_display(n), 28)), bold(&t)),
+                    Span::styled(format!("copy is safe, original kept: {}", trunc(&sanitize_display(e), 40)), Style::default().fg(t.warn)),
+                ]));
+            }
+        }
+        (Mode::Copy, Some(rep)) => {
+            lines.push(Line::from(vec![
+                Span::styled("originals  ", dim(&t)),
+                Span::styled(format!("{} deleted ({}) from the card", rep.deleted, human_bytes(rep.bytes)), bold(&t)),
+            ]));
+            for (n, e) in rep.failures.iter().take(6) {
+                lines.push(Line::from(vec![
+                    Span::styled("⚠ ", Style::default().fg(t.warn)),
+                    Span::styled(format!("{}: ", trunc(&sanitize_display(n), 28)), bold(&t)),
+                    Span::styled(format!("kept: {}", trunc(&sanitize_display(e), 44)), Style::default().fg(t.warn)),
+                ]));
+            }
+        }
+        (Mode::Copy, None) if !app.originals.is_empty() => {
+            let bytes: u64 = app.originals.iter().map(|o| o.size).sum();
+            lines.push(Line::from(vec![
+                Span::styled("originals  ", dim(&t)),
+                Span::styled(
+                    format!("still on the card · press d to delete the {} verified ones ({})", app.originals.len(), human_bytes(bytes)),
+                    Style::default().fg(t.accent),
+                ),
+            ]));
+            if app.ineligible > 0 {
+                lines.push(Line::from(Span::styled(
+                    format!("           {} file(s) were not verified and will never be offered for deletion", app.ineligible),
+                    dim(&t),
+                )));
+            }
+        }
+        _ => lines.push(Line::from(Span::styled("Nothing was deleted from the card.", dim(&t)))),
     }
     for (n, e) in s.failures.iter().take(8) {
         lines.push(Line::from(vec![
@@ -1021,7 +1131,7 @@ fn draw_stats(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &App, full: Rect) {
     let t = app.theme;
     let w = 64.min(full.width);
-    let h = 25.min(full.height);
+    let h = 27.min(full.height);
     let a = Rect { x: full.x + (full.width - w) / 2, y: full.y + (full.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, a);
     let blk = Block::bordered().border_type(BorderType::Double).border_style(Style::default().fg(t.accent)).title(title(&t, "Keys"));
@@ -1041,12 +1151,13 @@ fn draw_help(f: &mut Frame, app: &App, full: Rect) {
         kv("space", "include / exclude a file or a whole day"),
         kv("tab", "switch between files and shoot dates"),
         kv("a", "select all / none"),
+        kv("m", "mode: copy (keep) or move (delete originals)"),
         kv("enter", "start copying (checks free space first)"),
         sec("While copying"),
         kv("p", "pause / resume"),
         kv("esc", "cancel (partial files are removed)"),
         sec("After"),
-        kv("o  x", "open the folder · eject the card"),
+        kv("o  x  d", "open folder · eject · delete verified originals"),
         sec("Everywhere"),
         kv("mouse", "click rows, scroll wheel"),
         kv("?", "this help"),

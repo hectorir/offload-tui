@@ -258,8 +258,8 @@ fn settings_editor_edits_saves_and_validates() {
     assert_eq!(r.app.cfg.destination, "/tmp/new-backup");
     assert_eq!(Config::load(&r.paths.config).unwrap().destination, "/tmp/new-backup", "saved to disk");
 
-    // go to DJI profile's Subfolder: rows = 4 globals, header, name, subfolder
-    r.app.editor.cursor = 6;
+    // go to DJI profile's Subfolder: rows = 5 globals, header, name, subfolder
+    r.app.editor.cursor = 7;
     key(&mut r.app, KeyCode::Enter);
     r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     typ(&mut r.app, "../../evil");
@@ -271,7 +271,7 @@ fn settings_editor_edits_saves_and_validates() {
     assert!(r.app.editor.input.is_none());
 
     // edit include list
-    r.app.editor.cursor = 8;
+    r.app.editor.cursor = 9;
     key(&mut r.app, KeyCode::Enter);
     r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     typ(&mut r.app, "MP4, .mov wav");
@@ -301,7 +301,7 @@ fn cannot_delete_last_profile() {
     let mut r = rig();
     r.app.cfg.profiles.truncate(1);
     chr(&mut r.app, 'e');
-    r.app.editor.cursor = 4;
+    r.app.editor.cursor = 5;
     chr(&mut r.app, 'd');
     assert!(r.app.editor.confirm_delete.is_none());
     assert_eq!(r.app.cfg.profiles.len(), 1);
@@ -621,4 +621,216 @@ fn batch_screens_render_at_awkward_sizes() {
     for (w, h) in sizes {
         render(&mut r.app, w, h);
     }
+}
+
+// ---------- copy vs move, and deleting originals afterwards ----------
+
+fn mode_rig() -> Rig {
+    let r = rig();
+    fs::write(r.src.join("A.MP4"), vec![1u8; 700_000]).unwrap();
+    fs::write(r.src.join("B.MP4"), vec![2u8; 300_000]).unwrap();
+    fs::write(r.src.join("C.WAV"), vec![3u8; 50_000]).unwrap();
+    r
+}
+
+fn to_review(r: &mut Rig) {
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+}
+
+fn day_dir(r: &Rig) -> PathBuf {
+    r.dest.join(chrono::Local::now().format("%Y-%m-%d").to_string()).join("DJI")
+}
+
+#[test]
+fn review_defaults_to_copy_and_m_toggles_mode() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    assert_eq!(r.app.review.as_ref().unwrap().mode, offload::engine::Mode::Copy);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("COPY") && s.contains("originals stay on the card"), "{s}");
+    chr(&mut r.app, 'm');
+    assert_eq!(r.app.review.as_ref().unwrap().mode, offload::engine::Mode::Move);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("MOVE") && s.contains("originals deleted once verified"), "{s}");
+    chr(&mut r.app, 'm');
+    assert_eq!(r.app.review.as_ref().unwrap().mode, offload::engine::Mode::Copy);
+}
+
+#[test]
+fn config_default_mode_move_is_honoured() {
+    let mut r = mode_rig();
+    r.app.cfg.mode = "move".into();
+    to_review(&mut r);
+    assert_eq!(r.app.review.as_ref().unwrap().mode, offload::engine::Mode::Move);
+}
+
+#[test]
+fn move_needs_an_explicit_y_and_enter_does_not_confirm() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    chr(&mut r.app, 'm');
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Review, "asks first");
+    assert!(r.app.review.as_ref().unwrap().confirm_move);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("MOVE deletes each original"), "{s}");
+    key(&mut r.app, KeyCode::Enter); // Enter must NOT confirm a destructive action
+    assert_eq!(r.app.screen, Screen::Review);
+    assert!(!r.app.review.as_ref().unwrap().confirm_move, "any other key backs out");
+    assert!(r.src.join("A.MP4").exists() && !day_dir(&r).exists(), "nothing happened");
+
+    key(&mut r.app, KeyCode::Enter);
+    chr(&mut r.app, 'n');
+    assert_eq!(r.app.screen, Screen::Review);
+
+    key(&mut r.app, KeyCode::Enter);
+    chr(&mut r.app, 'y');
+    assert_eq!(r.app.screen, Screen::Running);
+    assert!(render(&mut r.app, 130, 40).contains("MOVING"));
+    wait_for(&mut r.app, Screen::Summary);
+    assert!(!r.src.join("A.MP4").exists() && !r.src.join("B.MP4").exists() && !r.src.join("C.WAV").exists(), "originals deleted after verification");
+    assert_eq!(fs::read(day_dir(&r).join("A.MP4")).unwrap(), vec![1u8; 700_000]);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("3 deleted from the card (moved)"), "{s}");
+    assert_eq!(r.app.summary.as_ref().unwrap().1.moved, 3);
+}
+
+#[test]
+fn copy_then_offer_to_delete_originals_with_explicit_confirmation() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+    assert!(r.src.join("A.MP4").exists(), "copy mode keeps originals");
+    assert_eq!(r.app.originals.len(), 3);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("press d to delete the 3 verified ones"), "{s}");
+    assert!(s.contains("d delete originals"), "footer offers it:\n{s}");
+
+    // d, then Enter: must NOT delete
+    chr(&mut r.app, 'd');
+    assert!(r.app.delete_confirm);
+    assert!(render(&mut r.app, 140, 40).contains("PERMANENTLY delete 3 originals"));
+    key(&mut r.app, KeyCode::Enter);
+    assert!(!r.app.delete_confirm);
+    assert!(r.src.join("A.MP4").exists() && r.src.join("B.MP4").exists() && r.src.join("C.WAV").exists());
+
+    // d, then another key: keeps
+    chr(&mut r.app, 'd');
+    chr(&mut r.app, 'n');
+    assert!(r.src.join("A.MP4").exists());
+
+    // d, then y: deletes
+    chr(&mut r.app, 'd');
+    chr(&mut r.app, 'y');
+    assert!(!r.src.join("A.MP4").exists() && !r.src.join("B.MP4").exists() && !r.src.join("C.WAV").exists());
+    assert_eq!(fs::read(day_dir(&r).join("B.MP4")).unwrap(), vec![2u8; 300_000], "the backups are untouched");
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("3 deleted") && s.contains("from the card"), "{s}");
+    assert!(!s.contains("press d to delete"), "the offer is gone");
+    chr(&mut r.app, 'd'); // nothing left to delete
+    assert!(!r.app.delete_confirm);
+}
+
+#[test]
+fn files_that_failed_are_never_offered_for_deletion() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut r = mode_rig();
+    to_review(&mut r);
+    fs::set_permissions(r.src.join("B.MP4"), fs::Permissions::from_mode(0o000)).unwrap();
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+    fs::set_permissions(r.src.join("B.MP4"), fs::Permissions::from_mode(0o644)).unwrap();
+    if r.app.summary.as_ref().unwrap().1.failed == 0 {
+        return; // running as root: permissions are ignored
+    }
+    assert_eq!(r.app.originals.len(), 2);
+    assert_eq!(r.app.ineligible, 1);
+    assert!(render(&mut r.app, 130, 40).contains("1 file(s) were not verified"));
+    chr(&mut r.app, 'd');
+    chr(&mut r.app, 'y');
+    assert!(r.src.join("B.MP4").exists(), "the file that failed to copy is untouched");
+    assert!(!r.src.join("A.MP4").exists() && !r.src.join("C.WAV").exists());
+}
+
+#[test]
+fn delete_refuses_originals_that_changed_after_the_copy() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+    fs::write(r.src.join("A.MP4"), b"new footage recorded after the offload").unwrap();
+    chr(&mut r.app, 'd');
+    chr(&mut r.app, 'y');
+    assert!(r.src.join("A.MP4").exists(), "modified original is kept");
+    assert!(!r.src.join("B.MP4").exists());
+    let rep = r.app.deleted.as_ref().unwrap();
+    assert_eq!((rep.deleted, rep.failures.len()), (2, 1));
+    assert!(render(&mut r.app, 130, 40).contains("A.MP4"));
+}
+
+#[test]
+fn no_delete_offer_after_a_move_or_when_nothing_was_verified() {
+    let mut r = mode_rig();
+    r.app.cfg.mode = "move".into();
+    to_review(&mut r);
+    key(&mut r.app, KeyCode::Enter);
+    chr(&mut r.app, 'y');
+    wait_for(&mut r.app, Screen::Summary);
+    chr(&mut r.app, 'd');
+    assert!(!r.app.delete_confirm, "moves already deleted; nothing more to offer");
+    assert!(!render(&mut r.app, 130, 40).contains("d delete originals"));
+}
+
+#[test]
+fn settings_can_set_the_default_mode() {
+    let mut r = mode_rig();
+    chr(&mut r.app, 'e');
+    let rows = r.app.editor_rows();
+    let i = rows.iter().position(|row| *row == Row::Global(GField::Mode)).unwrap();
+    r.app.editor.cursor = i;
+    assert!(render(&mut r.app, 120, 40).contains("copy (keep originals)"));
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.cfg.mode, "move");
+    assert_eq!(Config::load(&r.paths.config).unwrap().mode, "move", "saved");
+    assert!(render(&mut r.app, 120, 40).contains("move (delete originals once verified)"));
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.cfg.mode, "copy");
+}
+
+#[test]
+fn batch_move_deletes_from_both_cards_and_summary_says_so() {
+    let mut r = batch_rig();
+    chr(&mut r.app, 'b');
+    wait_for(&mut r.app, Screen::Review);
+    chr(&mut r.app, 'm');
+    key(&mut r.app, KeyCode::Enter);
+    chr(&mut r.app, 'y');
+    wait_for(&mut r.app, Screen::Summary);
+    assert_eq!(r.app.summary.as_ref().unwrap().1.moved, 4);
+    assert!(!r.src.join("DJI_0001.MP4").exists());
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert!(r.dest.join(&day).join("Sony/DSC0001.ARW").exists());
+}
+
+/// Renders the copy/move screens as text. Run: cargo test --test app_flow dump_modes -- --ignored --nocapture
+#[test]
+#[ignore]
+fn dump_modes() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    chr(&mut r.app, 'm');
+    println!("=====MOVE_REVIEW\n{}", render(&mut r.app, 120, 30));
+    key(&mut r.app, KeyCode::Enter);
+    println!("=====MOVE_CONFIRM\n{}", render(&mut r.app, 120, 30));
+    chr(&mut r.app, 'n');
+    chr(&mut r.app, 'm');
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+    println!("=====COPY_SUMMARY\n{}", render(&mut r.app, 120, 26));
+    chr(&mut r.app, 'd');
+    println!("=====DELETE_CONFIRM\n{}", render(&mut r.app, 140, 26));
+    chr(&mut r.app, 'y');
+    println!("=====AFTER_DELETE\n{}", render(&mut r.app, 120, 26));
 }

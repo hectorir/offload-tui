@@ -1,7 +1,7 @@
 //! Non-interactive `offload run`: scriptable copies with plain-text output.
 
 use crate::config::Config;
-use crate::engine::{self, Control, Event, Outcome};
+use crate::engine::{self, Control, Event, Mode, Outcome, Removal};
 use crate::fsutil::{human_bytes, human_duration, human_rate, sanitize_display};
 use crate::{history, scan};
 use anyhow::{Result, bail};
@@ -23,10 +23,13 @@ pub struct Options<'a> {
     pub all: bool,
     pub yes: bool,
     pub dry_run: bool,
+    /// Force copy or move for this run; `None` uses the config's `mode`.
+    pub mode: Option<Mode>,
 }
 
 pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<i32> {
-    let Options { names, all, yes, dry_run } = *opts;
+    let Options { names, all, yes, dry_run, mode } = *opts;
+    let mode = mode.unwrap_or_else(|| Mode::from_config(&cfg.mode));
     // Resolve which cameras to include, in config order, without duplicates.
     let mut idxs: Vec<usize> = vec![];
     if all {
@@ -83,12 +86,14 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
         .map(|i| engine::BatchPart { profile_index: *i, profile: &cfg.profiles[*i], files: scan.files.iter().filter(|f| f.profile == *i).collect() })
         .filter(|p| !p.files.is_empty())
         .collect();
-    let plan = engine::build_batch_plan(cfg, &batch_parts, chrono::Local::now())?;
+    let mut plan = engine::build_batch_plan(cfg, &batch_parts, chrono::Local::now())?;
+    plan.mode = mode;
     writeln!(out, "{} files, {} -> {}", plan.items.len(), human_bytes(plan.total_bytes()), sanitize_display(&plan.dest_dir.display().to_string()))?;
     if dry_run {
         for it in &plan.items {
             let tag = if batch { format!("[{}] ", sanitize_display(&cfg.profiles[it.group].name)) } else { String::new() };
-            writeln!(out, "  would copy {tag}{}  ({})", sanitize_display(&it.name), human_bytes(it.size))?;
+            let verb = if mode == Mode::Move { "would move" } else { "would copy" };
+            writeln!(out, "  {verb} {tag}{}  ({})", sanitize_display(&it.name), human_bytes(it.size))?;
         }
         writeln!(out, "Dry run: nothing was written.")?;
         return Ok(0);
@@ -98,7 +103,11 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
         return Ok(2);
     }
     if !yes {
-        write!(out, "Copy and verify? [y/N] ")?;
+        if mode == Mode::Move {
+            write!(out, "MOVE: copy, verify, then DELETE each original from the card? [y/N] ")?;
+        } else {
+            write!(out, "Copy and verify? [y/N] ")?;
+        }
         out.flush()?;
         let mut line = String::new();
         input.read_line(&mut line)?;
@@ -131,8 +140,11 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
                 let name = if batch { format!("[{}] {name}", sanitize_display(&cfg.profiles[plan.items[index].group].name)) } else { name };
                 outcomes[index] = Some(outcome.clone());
                 let line = match outcome {
+                    Outcome::Copied { removed: Removal::Removed, .. } => format!("moved      {name} (verified, original deleted)"),
+                    Outcome::Copied { removed: Removal::Failed(e), .. } => format!("verified   {name} (original NOT deleted: {})", sanitize_display(&e)),
                     Outcome::Copied { renamed: true, .. } => format!("verified (name clashed, kept both)  {name}"),
                     Outcome::Copied { .. } => format!("verified   {name}"),
+                    Outcome::Skipped { removed: Removal::Removed, .. } => format!("skipped    {name} (identical copy already there; original deleted)"),
                     Outcome::Skipped { .. } => format!("skipped    {name} (identical copy already there)"),
                     Outcome::Failed(e) => format!("FAILED     {name}: {}", sanitize_display(&e)),
                     Outcome::Cancelled => format!("cancelled  {name}"),
@@ -211,5 +223,8 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
         human_duration(summary.elapsed.as_secs()),
         rate
     )?;
+    if mode == Mode::Move {
+        writeln!(out, "{} originals deleted from the card, {} kept", summary.moved, summary.move_failures.len())?;
+    }
     Ok(if summary.failed > 0 || summary.cancelled { 1 } else { 0 })
 }

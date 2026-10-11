@@ -1,7 +1,7 @@
 //! Application state and input handling (rendering lives in `ui`).
 
 use crate::config::{self, Config, Profile};
-use crate::engine::{self, Control, Event, Outcome, Plan, Summary};
+use crate::engine::{self, Control, Event, Mode, Original, Outcome, Plan, Removal, Summary};
 use crate::fsutil;
 use crate::history::{self, Record};
 use crate::scan::{self, ScanResult};
@@ -90,6 +90,10 @@ pub struct Review {
     pub dest_dir: PathBuf,
     pub dest: DestLive,
     pub error: Option<String>,
+    /// Copy keeps originals; Move deletes each original once its copy is verified.
+    pub mode: Mode,
+    /// Move mode asks for an explicit yes before starting.
+    pub confirm_move: bool,
 }
 
 impl Review {
@@ -161,19 +165,22 @@ pub enum ItemState {
     Queued,
     Copying(u64),
     Verifying(u64),
-    Copied { renamed: bool },
-    Skipped,
+    Copied { renamed: bool, removal: Removal },
+    Skipped { removal: Removal },
     Failed(String),
     Cancelled,
 }
 
 impl ItemState {
     pub fn is_final(&self) -> bool {
-        matches!(self, ItemState::Copied { .. } | ItemState::Skipped | ItemState::Failed(_) | ItemState::Cancelled)
+        matches!(self, ItemState::Copied { .. } | ItemState::Skipped { .. } | ItemState::Failed(_) | ItemState::Cancelled)
     }
 }
 
 pub struct Run {
+    pub mode: Mode,
+    /// Where each file's verified copy ended up (for deleting originals afterwards).
+    pub dests: Vec<Option<PathBuf>>,
     pub profiles: Vec<usize>,
     pub plan: Plan,
     pub state: Vec<ItemState>,
@@ -226,6 +233,7 @@ pub enum GField {
     Destination,
     DateFormat,
     Notify,
+    Mode,
     Theme,
 }
 
@@ -300,6 +308,13 @@ pub struct App {
     pub run: Option<Run>,
     pub summary: Option<(Vec<usize>, Summary)>,
     pub per_profile: Vec<PerProfile>,
+    /// Copy mode: verified originals that can now be deleted from the card, how many files were not eligible,
+    /// and the result once deleted.
+    pub originals: Vec<Original>,
+    pub ineligible: usize,
+    pub run_mode: Mode,
+    pub delete_confirm: bool,
+    pub deleted: Option<engine::DeleteReport>,
     pub eject_confirm: Option<Vec<PathBuf>>,
     pub editor: Editor,
     pub stats: Option<StatsView>,
@@ -337,6 +352,11 @@ impl App {
             run: None,
             summary: None,
             per_profile: vec![],
+            originals: vec![],
+            ineligible: 0,
+            run_mode: Mode::Copy,
+            delete_confirm: false,
+            deleted: None,
             eject_confirm: None,
             editor: Editor::default(),
             stats: None,
@@ -461,6 +481,8 @@ impl App {
             dest: dest_live(&dest_dir),
             dest_dir,
             error: None,
+            mode: Mode::from_config(&self.cfg.mode),
+            confirm_move: false,
             scan,
         });
         self.screen = Screen::Review;
@@ -504,10 +526,15 @@ impl App {
                         }
                     }
                     Event::Done { index, outcome } => {
+                        if let Outcome::Copied { dest, .. } | Outcome::Skipped { dest, .. } = &outcome
+                            && let Some(d) = run.dests.get_mut(index)
+                        {
+                            *d = Some(dest.clone());
+                        }
                         if let Some(s) = run.state.get_mut(index) {
                             *s = match outcome {
-                                Outcome::Copied { renamed, .. } => ItemState::Copied { renamed },
-                                Outcome::Skipped { .. } => ItemState::Skipped,
+                                Outcome::Copied { renamed, removed, .. } => ItemState::Copied { renamed, removal: removed },
+                                Outcome::Skipped { removed, .. } => ItemState::Skipped { removal: removed },
                                 Outcome::Failed(e) => ItemState::Failed(e),
                                 Outcome::Cancelled => ItemState::Cancelled,
                             };
@@ -556,7 +583,7 @@ impl App {
                         pp.copied += 1;
                         pp.bytes += item.size;
                     }
-                    ItemState::Skipped => pp.skipped += 1,
+                    ItemState::Skipped { .. } => pp.skipped += 1,
                     ItemState::Failed(_) => pp.failed += 1,
                     _ => {}
                 }
@@ -592,6 +619,23 @@ impl App {
                 format!("{name}: {} files copied & verified ({})", s.copied + s.skipped, fsutil::human_bytes(s.bytes_copied))
             };
             sys::notify("offload", &body);
+        }
+        // Copy mode: remember which originals are now safely backed up (verified copy or identical copy
+        // already there), so the summary can offer to delete them. Failed/cancelled files are never eligible.
+        self.originals.clear();
+        self.ineligible = 0;
+        self.deleted = None;
+        self.delete_confirm = false;
+        self.run_mode = run.mode;
+        if run.mode == Mode::Copy {
+            for ((item, st), dest) in run.plan.items.iter().zip(&run.state).zip(&run.dests) {
+                match (st, dest) {
+                    (ItemState::Copied { .. } | ItemState::Skipped { .. }, Some(d)) => {
+                        self.originals.push(Original { source: item.source.clone(), size: item.size, modified: item.modified, dest: d.clone() })
+                    }
+                    _ => self.ineligible += 1,
+                }
+            }
         }
         self.per_profile = per;
         self.summary = Some((run.profiles.clone(), s));
@@ -659,6 +703,13 @@ impl App {
             rv.error = Some(e);
             return;
         }
+        let mut plan = plan;
+        plan.mode = rv.mode;
+        if rv.mode == Mode::Move && !rv.confirm_move {
+            rv.confirm_move = true; // moving deletes originals: ask first
+            return;
+        }
+        rv.confirm_move = false;
         rv.error = None;
         let (tx, rx) = mpsc::channel();
         let ctrl = Control::new();
@@ -670,6 +721,8 @@ impl App {
         let n = plan.items.len();
         let now = Instant::now();
         self.run = Some(Run {
+            mode: plan.mode,
+            dests: vec![None; n],
             profiles: parts.iter().map(|p| p.profile_index).collect(),
             plan,
             state: vec![ItemState::Queued; n],
@@ -791,6 +844,19 @@ impl App {
 
     fn review_key(&mut self, key: KeyEvent) {
         let Some(rv) = &mut self.review else { return };
+        if rv.confirm_move {
+            // Only an explicit y starts a move; anything else backs out (Enter alone does not confirm).
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.start_run();
+            } else {
+                rv.confirm_move = false;
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('m') {
+            rv.mode = rv.mode.toggled();
+            return;
+        }
         let page = self.list_height.max(1);
         let (len, cursor) = match rv.focus {
             Focus::Files => (rv.scan.files.len(), &mut rv.cursor),
@@ -892,6 +958,27 @@ impl App {
     }
 
     fn summary_key(&mut self, key: KeyEvent) {
+        if self.delete_confirm {
+            self.delete_confirm = false;
+            // Explicit y only. Enter does not confirm an irreversible delete.
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                let report = engine::delete_originals(&self.originals);
+                let msg = if report.failures.is_empty() {
+                    format!("Deleted {} originals ({}) from the card. Safe to eject.", report.deleted, fsutil::human_bytes(report.bytes))
+                } else {
+                    format!("Deleted {}, kept {} (see summary)", report.deleted, report.failures.len())
+                };
+                let level = if report.failures.is_empty() { Level::Ok } else { Level::Warn };
+                self.originals.clear();
+                self.deleted = Some(report);
+                self.toast(msg, level);
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('d') && self.run_mode == Mode::Copy && !self.originals.is_empty() && self.deleted.is_none() {
+            self.delete_confirm = true;
+            return;
+        }
         if let Some(vols) = self.eject_confirm.clone() {
             self.eject_confirm = None;
             if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter) {
@@ -940,6 +1027,8 @@ impl App {
             }
             KeyCode::Char('s') | KeyCode::Char('h') => self.open_stats(),
             KeyCode::Enter | KeyCode::Esc => {
+                self.originals.clear();
+                self.deleted = None;
                 self.summary = None;
                 self.review = None;
                 self.refresh_live();
@@ -967,7 +1056,13 @@ impl App {
     // ---------- config editor ----------
 
     pub fn editor_rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::Global(GField::Destination), Row::Global(GField::DateFormat), Row::Global(GField::Notify), Row::Global(GField::Theme)];
+        let mut rows = vec![
+            Row::Global(GField::Destination),
+            Row::Global(GField::DateFormat),
+            Row::Global(GField::Notify),
+            Row::Global(GField::Mode),
+            Row::Global(GField::Theme),
+        ];
         for i in 0..self.cfg.profiles.len() {
             rows.push(Row::Header(i));
             for f in [PField::Name, PField::Subfolder, PField::Sources, PField::Include, PField::Exclude, PField::Icon, PField::Destination] {
@@ -983,6 +1078,10 @@ impl App {
             Row::Global(GField::Destination) => ("Backup folder".into(), self.cfg.destination.clone()),
             Row::Global(GField::DateFormat) => ("Date folder format".into(), self.cfg.date_format.clone()),
             Row::Global(GField::Notify) => ("Notify when done".into(), if self.cfg.notify { "on" } else { "off" }.into()),
+            Row::Global(GField::Mode) => (
+                "Default mode".into(),
+                if self.cfg.mode.eq_ignore_ascii_case("move") { "move (delete originals once verified)" } else { "copy (keep originals)" }.into(),
+            ),
             Row::Global(GField::Theme) => ("Theme".into(), self.theme.name.into()),
             Row::Header(i) => (self.cfg.profiles[i].name.clone(), String::new()),
             Row::Field(i, f) => {
@@ -1042,6 +1141,11 @@ impl App {
             Row::Global(GField::Notify) => {
                 let mut next = self.cfg.clone();
                 next.notify = !next.notify;
+                self.commit(next, "Saved");
+            }
+            Row::Global(GField::Mode) => {
+                let mut next = self.cfg.clone();
+                next.mode = Mode::from_config(&next.mode).toggled().label().into();
                 self.commit(next, "Saved");
             }
             Row::Global(GField::Theme) => {

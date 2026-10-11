@@ -20,6 +20,9 @@ pub struct Config {
     /// Send a desktop notification when a copy finishes.
     #[serde(default = "yes")]
     pub notify: bool,
+    /// Default for each run: "copy" keeps originals on the card; "move" deletes each original once its copy is verified.
+    #[serde(default = "default_mode")]
+    pub mode: String,
     #[serde(default, rename = "profile")]
     pub profiles: Vec<Profile>,
 }
@@ -57,6 +60,9 @@ fn default_theme() -> String {
 fn default_icon() -> String {
     "camera".into()
 }
+fn default_mode() -> String {
+    "copy".into()
+}
 fn yes() -> bool {
     true
 }
@@ -69,6 +75,7 @@ impl Default for Config {
             date_format: default_date_format(),
             theme: default_theme(),
             notify: true,
+            mode: default_mode(),
             profiles: vec![
                 Profile {
                     name: "DJI Osmo Action".into(),
@@ -166,6 +173,9 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         if self.destination.trim().is_empty() {
             bail!("destination is empty");
+        }
+        if !matches!(self.mode.to_lowercase().as_str(), "copy" | "move") {
+            bail!("mode must be \"copy\" or \"move\" (got \"{}\")", self.mode);
         }
         if self.profiles.is_empty() {
             bail!("no profiles defined");
@@ -328,6 +338,16 @@ mod tests {
             c.profiles[0].subfolder = bad.into();
             assert!(c.validate().is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn mode_defaults_to_copy_and_is_validated() {
+        let c = Config::default();
+        assert_eq!(c.mode, "copy");
+        assert!(Config::from_toml("mode = 'move'\n[[profile]]\nname='X'\nsources=['/a']\ninclude=['jpg']\n").is_ok());
+        assert!(Config::from_toml("mode = 'delete'\n[[profile]]\nname='X'\nsources=['/a']\ninclude=['jpg']\n").is_err());
+        let c = Config::from_toml("[[profile]]\nname='X'\nsources=['/a']\ninclude=['jpg']\n").unwrap();
+        assert_eq!(c.mode, "copy");
     }
 
     #[test]

@@ -277,3 +277,66 @@ fn run_requires_a_profile_or_all() {
     assert!(out(&o).contains("no profile matching 'ghost'"));
     assert!(!e.p("backup").exists(), "an unknown name aborts before anything is written");
 }
+
+#[test]
+fn move_flag_deletes_originals_after_verified_copy() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--move"]).output().unwrap();
+    let s = out(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("moved") && s.contains("2 originals deleted from the card, 0 kept"), "{s}");
+    assert!(!e.p("card/DCIM/100/A.MP4").exists() && !e.p("card/DCIM/100/B.wav").exists());
+    assert!(e.p("card/DCIM/100/A.LRF").exists(), "files that were never in the plan are untouched");
+    let dest = e.p("backup").join(chrono_today()).join("Cam");
+    assert_eq!(fs::read(dest.join("A.MP4")).unwrap(), vec![7u8; 100_000]);
+}
+
+#[test]
+fn move_dry_run_and_declined_prompt_delete_nothing() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--move", "--dry-run"]).output().unwrap();
+    assert!(out(&o).contains("would move A.MP4"), "{}", out(&o));
+    assert!(e.p("card/DCIM/100/A.MP4").exists());
+
+    let mut child = e
+        .cmd()
+        .args(["--config", cfg.to_str().unwrap(), "run", "test", "--move"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"n\n").unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(out(&o).contains("DELETE each original"), "{}", out(&o));
+    assert!(e.p("card/DCIM/100/A.MP4").exists() && !e.p("backup").exists());
+}
+
+#[test]
+fn config_mode_move_is_the_default_and_copy_flag_overrides_it() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let text = fs::read_to_string(&cfg).unwrap();
+    fs::write(&cfg, format!("mode = 'move'\n{text}")).unwrap();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--copy"]).output().unwrap();
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(e.p("card/DCIM/100/A.MP4").exists(), "--copy keeps originals even if the config says move");
+    // second run honours the config's move default (files are already backed up -> skipped, originals removed)
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes"]).output().unwrap();
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("original deleted"), "{}", out(&o));
+    assert!(!e.p("card/DCIM/100/A.MP4").exists());
+}
+
+#[test]
+fn move_and_copy_flags_conflict() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--move", "--copy", "--yes"]).output().unwrap();
+    assert!(!o.status.success());
+    assert!(e.p("card/DCIM/100/A.MP4").exists());
+}

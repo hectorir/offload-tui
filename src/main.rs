@@ -31,6 +31,12 @@ enum Cmd {
         /// Show what would be copied, write nothing
         #[arg(long)]
         dry_run: bool,
+        /// Move: delete each original from the card right after its copy is verified
+        #[arg(long = "move", conflicts_with = "keep")]
+        move_: bool,
+        /// Copy: keep the originals (overrides `mode = "move"` in the config)
+        #[arg(long = "copy", id = "keep")]
+        keep: bool,
     },
     /// List profiles and whether their cards are connected
     Profiles,
@@ -76,11 +82,23 @@ fn real_main() -> Result<()> {
             let cfg = Config::load_or_default(&cfg_path)?;
             tui::run(App::new(cfg, paths))
         }
-        Some(Cmd::Run { profiles, all, yes, dry_run }) => {
+        Some(Cmd::Run { profiles, all, yes, dry_run, move_, keep }) => {
+            let mode = if move_ {
+                Some(offload::engine::Mode::Move)
+            } else if keep {
+                Some(offload::engine::Mode::Copy)
+            } else {
+                None
+            };
             let cfg = Config::load_or_default(&cfg_path)?;
             let stdin = std::io::stdin();
-            let code =
-                headless::run(&cfg, &headless::Options { names: &profiles, all, yes, dry_run }, &paths.history, &mut stdin.lock(), &mut std::io::stdout())?;
+            let code = headless::run(
+                &cfg,
+                &headless::Options { names: &profiles, all, yes, dry_run, mode },
+                &paths.history,
+                &mut stdin.lock(),
+                &mut std::io::stdout(),
+            )?;
             std::process::exit(code);
         }
         Some(Cmd::Profiles) => {

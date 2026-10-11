@@ -55,8 +55,8 @@ tell you the copy *finished*; `offload` tells you the copy is *correct*.
 - **Verified, not hoped-for.** Each file is copied to a hidden `.part` file, flushed to disk, re-read with
   the OS cache bypassed, and compared by BLAKE3 hash against the bytes read from the card. Only then is it
   renamed to its real name. A truncated or corrupt file can never carry a real name.
-- **Never destructive.** Sources are opened read-only. Nothing is ever deleted from your card, and nothing
-  at the destination is ever overwritten. If a *different* file already has that name, both are kept
+- **Never destructive by default.** Sources are opened read-only and, in the default *copy* mode, nothing is
+  ever deleted from your card. Nothing at the destination is ever overwritten. If a *different* file already has that name, both are kept
   (`C0001.MP4`, `C0001_1.MP4`).
 - **Safe to re-run.** Interrupted? Run it again. Files already on the destination with a matching checksum
   are skipped; half-written `.part` files are replaced.
@@ -96,6 +96,7 @@ whether its card is plugged in (it updates once a second, so you can plug in aft
 3. **Copy.** <kbd>enter</kbd> starts. <kbd>p</kbd> pauses, <kbd>esc</kbd> cancels (partial files are removed).
 4. **Done.** A summary shows what was copied, skipped, renamed or failed. <kbd>o</kbd> opens the folder,
    <kbd>x</kbd> ejects the card, and a desktop notification fires if you walked away.
+   In copy mode the summary also offers <kbd>d</kbd> to delete the verified originals (see below).
 
 ```
  ╭ Batch · DJI + Sony · 15 of 15 selected ────────────────────────────╮╭ Ready to copy ─────────────────────────────────╮
@@ -167,6 +168,32 @@ space toggle  a all/none  tab dates  enter copy  esc back  ? help
 p pause  ↑↓ scroll  f follow  esc cancel
 ```
 
+### Copy or move, and deleting originals
+
+Press <kbd>m</kbd> on the review screen to choose what happens to the originals on the card:
+
+| Mode | Originals | Use it when |
+| --- | --- | --- |
+| **Copy** (default) | stay on the card | you want to check the backup first |
+| **Move** | each one is deleted right after *its* copy is verified | you want the card emptied as you go |
+
+**Delete after a copy.** In copy mode, once the run finishes the summary says
+*"press d to delete the N verified originals (X GB)"*. This is the cautious route: back up, look it over,
+then clear the card. Deleting asks for an explicit <kbd>y</kbd> (<kbd>enter</kbd> alone does not confirm).
+
+The guardrails are the same for a move and for a later delete:
+
+- an original is only ever deleted if its copy was **checksum-verified** (or an identical copy was already
+  there, confirmed by checksum), the copy is **still on the destination** with the right size, and the
+  original is a plain file that **has not changed since it was scanned**;
+- on any doubt the original is **kept** and reported; failed, cancelled and unverified files are never touched;
+- cancelling a move leaves every not-yet-verified original on the card;
+- only files in the plan are ever deleted. Nothing else on the card is touched. Deletion is permanent
+  (it does not use the Trash), which is why it is always behind a confirmation.
+
+Set your default with `mode = "move"` in the config, or in the settings screen (<kbd>e</kbd>). From a script:
+`offload run dji --move --yes` or `--copy` to override the config.
+
 ### Batch: both cameras in one go
 
 With two or more profiles, the home screen shows a **batch card**. Press <kbd>b</kbd> (or <kbd>0</kbd>, or
@@ -223,6 +250,7 @@ destination = "/Volumes/Old External Drives/0 Photos & My Footage/Needs to Back 
 date_format = "%Y-%m-%d"        # strftime; must produce a single folder name
 theme       = "catppuccin"      # catppuccin | nord | gruvbox | dracula | mono
 notify      = true              # desktop notification when a copy finishes
+mode        = "copy"            # copy = keep originals | move = delete each once verified
 
 [[profile]]
 name      = "DJI Osmo Action"
@@ -265,7 +293,7 @@ If you set up a camera that others use, open a PR adding it to [`examples/`](exa
 
 ```
 offload                          open the TUI
-offload run <profile>... [--all] [--yes] [--dry-run]
+offload run <profile>... [--all] [--yes] [--dry-run] [--move | --copy]
                                  copy without the UI (for scripts); partial names work: `offload run dji`;
                                  several names or --all copy them together as one batch
 offload profiles                 list profiles and whether their cards are connected
@@ -288,10 +316,12 @@ Exit codes: `0` success, `1` some files failed/cancelled/aborted, `2` error (bad
 | Review | `space` | toggle file / whole day |
 | | `tab` | switch files ⇄ shoot dates |
 | | `a` | select all / none |
+| | `m` | mode: copy (keep originals) / move (delete once verified) |
 | | `enter` | start (blocked if no space or drive missing) |
 | Copying | `p` | pause / resume |
 | | `esc` | cancel (asks first) |
 | Summary | `o` `x` | open folder · eject card (asks first) |
+| | `d` | delete the verified originals (copy mode; asks first) |
 | Anywhere | `?` | help |
 | | `ctrl+c` | quit (cleans up partial files) |
 

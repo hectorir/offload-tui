@@ -271,7 +271,7 @@ fn space_guard_and_missing_volume() {
     let err = engine::preflight(&missing).unwrap_err();
     assert!(err.contains("not mounted"), "{err}");
 
-    let empty = Plan { dest_dir: plan.dest_dir.clone(), items: vec![] };
+    let empty = Plan { dest_dir: plan.dest_dir.clone(), items: vec![], mode: engine::Mode::Copy };
     assert!(engine::preflight(&empty).is_err());
 }
 
@@ -453,4 +453,137 @@ fn merge_scans_tags_files_and_sources_by_camera() {
         assert!(f.path.starts_with(&m.sources[f.source].path));
     }
     assert_eq!(m.sources.len(), r.cfg.profiles[0].sources.len() + 2);
+}
+
+// ---------- move mode: originals are deleted only once their copy is verified ----------
+
+fn run_mode(plan: &Plan, mode: engine::Mode) -> (Summary, Vec<Event>) {
+    let mut p = plan.clone();
+    p.mode = mode;
+    run(&p)
+}
+
+#[test]
+fn move_deletes_each_original_after_verification_and_keeps_the_backup() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(3_000_000, 1)).unwrap();
+    fs::write(r.src.join("b.wav"), pattern(10_000, 2)).unwrap();
+    fs::write(r.src.join("keep.LRF"), b"not selected").unwrap(); // never in the plan -> never touched
+    fs::write(r.src.join("photo.jpg"), b"not wanted").unwrap();
+    let plan = plan_for(&r);
+    let (s, ev) = run_mode(&plan, engine::Mode::Move);
+    assert_eq!((s.copied, s.failed, s.moved), (2, 0, 2), "{:?} {:?}", s.failures, s.move_failures);
+    assert!(!r.src.join("a.mp4").exists() && !r.src.join("b.wav").exists(), "originals deleted after verification");
+    assert!(r.src.join("keep.LRF").exists() && r.src.join("photo.jpg").exists(), "files outside the plan are never touched");
+    assert_eq!(fs::read(plan.dest_dir.join("a.mp4")).unwrap(), pattern(3_000_000, 1));
+    assert_eq!(fs::read(plan.dest_dir.join("b.wav")).unwrap(), pattern(10_000, 2));
+    assert!(ev.iter().filter(|e| matches!(e, Event::Done { outcome: Outcome::Copied { removed: engine::Removal::Removed, .. }, .. })).count() == 2);
+}
+
+#[test]
+fn copy_mode_never_deletes_anything() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(5000, 1)).unwrap();
+    let plan = plan_for(&r);
+    let (s, _) = run_mode(&plan, engine::Mode::Copy);
+    assert_eq!((s.copied, s.moved), (1, 0));
+    assert!(r.src.join("a.mp4").exists());
+}
+
+#[test]
+fn move_keeps_the_original_when_the_copy_fails() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(5000, 1)).unwrap();
+    let plan = plan_for(&r);
+    // sabotage: the destination folder is a symlink, so the copy is refused
+    let elsewhere = r._tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(plan.dest_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &plan.dest_dir).unwrap();
+    let (s, _) = run_mode(&plan, engine::Mode::Move);
+    assert_eq!((s.copied, s.failed, s.moved), (0, 1, 0));
+    assert!(r.src.join("a.mp4").exists(), "a failed copy must never cost you the original");
+}
+
+#[test]
+fn move_keeps_the_original_when_cancelled() {
+    let r = rig();
+    for i in 0..4u8 {
+        fs::write(r.src.join(format!("f{i}.mp4")), pattern(6 * 1024 * 1024, i)).unwrap();
+    }
+    let mut plan = plan_for(&r);
+    plan.mode = engine::Mode::Move;
+    let (tx, rx) = mpsc::channel();
+    let ctrl = Control::new();
+    let c2 = ctrl.clone();
+    let watcher = std::thread::spawn(move || {
+        let mut n = 0;
+        while let Ok(e) = rx.recv() {
+            if matches!(e, Event::Progress { .. }) {
+                n += 1;
+                if n == 2 {
+                    c2.cancel();
+                }
+            }
+            if matches!(e, Event::Finished(_)) {
+                break;
+            }
+        }
+    });
+    let s = engine::run(&plan, &ctrl, tx);
+    watcher.join().unwrap();
+    assert!(s.cancelled);
+    // every original is either safely backed up (and then may be gone) or still on the card
+    for i in 0..4u8 {
+        let name = format!("f{i}.mp4");
+        let orig = r.src.join(&name);
+        let backup = plan.dest_dir.join(&name);
+        if backup.exists() {
+            assert_eq!(fs::read(&backup).unwrap(), pattern(6 * 1024 * 1024, i), "{name}: anything at its real name is complete");
+        } else {
+            assert!(orig.exists(), "{name}: not backed up, so the original must still exist");
+        }
+    }
+}
+
+#[test]
+fn move_keeps_the_original_if_it_changed_after_the_scan() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(5000, 1)).unwrap();
+    let plan = plan_for(&r);
+    // the camera/user touches the file after scanning but before the copy
+    fs::write(r.src.join("a.mp4"), pattern(5000, 9)).unwrap();
+    let (s, _) = run_mode(&plan, engine::Mode::Move);
+    assert_eq!((s.copied, s.moved), (1, 0), "{:?}", s.failures);
+    assert_eq!(s.move_failures.len(), 1, "the copy is safe but the original is kept and reported");
+    assert!(s.move_failures[0].1.contains("changed"));
+    assert!(r.src.join("a.mp4").exists());
+}
+
+#[test]
+fn move_of_an_already_backed_up_file_deletes_the_original_only_after_checksum_match() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(20_000, 1)).unwrap();
+    fs::write(r.src.join("b.mp4"), pattern(20_000, 2)).unwrap();
+    let plan = plan_for(&r);
+    run_mode(&plan, engine::Mode::Copy); // first, back both up
+    // b's backup gets silently corrupted (same size, different bytes)
+    fs::write(plan.dest_dir.join("b.mp4"), pattern(20_000, 77)).unwrap();
+    let (s, _) = run_mode(&plan, engine::Mode::Move);
+    assert_eq!(s.skipped, 1, "a.mp4 matches by checksum");
+    assert_eq!(s.copied, 1, "b.mp4's backup is corrupt, so it is copied again (renamed), not trusted");
+    assert!(!r.src.join("a.mp4").exists(), "identical backup confirmed -> original removed");
+    assert!(!r.src.join("b.mp4").exists(), "fresh verified copy exists -> original removed");
+    assert_eq!(fs::read(plan.dest_dir.join("b_1.mp4")).unwrap(), pattern(20_000, 2));
+}
+
+#[test]
+fn batch_move_deletes_from_each_card() {
+    let (r, sony, _clip) = batch_rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    fs::write(sony.join("b.arw"), pattern(1000, 2)).unwrap();
+    let plan = batch_plan(&r);
+    let (s, _) = run_mode(&plan, engine::Mode::Move);
+    assert_eq!((s.copied, s.moved, s.failed), (2, 2, 0));
+    assert!(!r.src.join("a.mp4").exists() && !sony.join("b.arw").exists());
 }
