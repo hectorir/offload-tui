@@ -195,7 +195,7 @@ mod tests {
     fn flush_falls_back_on_unsupported_but_reports_real_errors() {
         let d = tempfile::tempdir().unwrap();
         let f = File::create(d.path().join("f")).unwrap();
-        let enotsup = || Err(std::io::Error::from_raw_os_error(45));
+        let enotsup = || Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
         let eio = || Err(std::io::Error::from_raw_os_error(libc::EIO));
         // full flush unsupported (SMB) -> plain fsync used
         assert!(flush_with(&f, |_| enotsup(), |_| Ok(())).is_ok());
