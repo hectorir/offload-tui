@@ -42,6 +42,14 @@ fn run(plan: &Plan) -> (Summary, Vec<Event>) {
     (s, rx.try_iter().collect())
 }
 
+/// Point a whole plan at a different folder.
+fn retarget(plan: &mut Plan, dir: &str) {
+    plan.dest_dir = PathBuf::from(dir);
+    for it in &mut plan.items {
+        it.dest_dir = PathBuf::from(dir);
+    }
+}
+
 fn list(dir: &Path) -> Vec<String> {
     let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     v.sort();
@@ -259,7 +267,7 @@ fn space_guard_and_missing_volume() {
     assert!(err.contains("Not enough space"), "{err}");
 
     let mut missing = plan_for(&r);
-    missing.dest_dir = PathBuf::from("/Volumes/definitely-not-mounted-zz/Backup/2026-01-01/DJI");
+    retarget(&mut missing, "/Volumes/definitely-not-mounted-zz/Backup/2026-01-01/DJI");
     let err = engine::preflight(&missing).unwrap_err();
     assert!(err.contains("not mounted"), "{err}");
 
@@ -272,7 +280,7 @@ fn unmounted_destination_volume_creates_nothing() {
     let r = rig();
     fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
     let mut plan = plan_for(&r);
-    plan.dest_dir = PathBuf::from("/Volumes/definitely-not-mounted-zz/Backup/2026-01-01/DJI");
+    retarget(&mut plan, "/Volumes/definitely-not-mounted-zz/Backup/2026-01-01/DJI");
     let (s, _) = run(&plan);
     assert_eq!((s.copied, s.failed), (0, 1));
     assert!(!Path::new("/Volumes/definitely-not-mounted-zz").exists());
@@ -338,4 +346,111 @@ fn custom_date_and_subfolder_layout() {
     let plan = plan_for(&r);
     let want = r.dest.join(chrono::Local::now().format("Shoot %d-%m-%Y").to_string());
     assert_eq!(plan.dest_dir, want);
+}
+
+// ---------- batches: several cameras in one run ----------
+
+fn batch_rig() -> (Rig, PathBuf, PathBuf) {
+    let mut r = rig();
+    let sony = r._tmp.path().join("sony/DCIM");
+    let clip = r._tmp.path().join("sony/CLIP");
+    fs::create_dir_all(&sony).unwrap();
+    fs::create_dir_all(&clip).unwrap();
+    r.cfg.profiles[1].sources = vec![sony.to_string_lossy().into(), clip.to_string_lossy().into()];
+    (r, sony, clip)
+}
+
+fn batch_plan(r: &Rig) -> Plan {
+    let scans: Vec<_> = (0..2).map(|i| (i, scan_profile(&r.cfg.profiles[i]))).collect();
+    let merged = offload::scan::merge_scans(scans);
+    let parts: Vec<engine::BatchPart> = (0..2)
+        .map(|i| engine::BatchPart { profile_index: i, profile: &r.cfg.profiles[i], files: merged.files.iter().filter(|f| f.profile == i).collect() })
+        .collect();
+    engine::build_batch_plan(&r.cfg, &parts, chrono::Local::now()).unwrap()
+}
+
+#[test]
+fn batch_copies_each_camera_into_its_own_subfolder() {
+    let (r, sony, clip) = batch_rig();
+    fs::write(r.src.join("DJI_0001.MP4"), pattern(70_000, 1)).unwrap();
+    fs::write(r.src.join("DJI_0001.WAV"), pattern(9_000, 2)).unwrap();
+    fs::write(r.src.join("DJI_0001.LRF"), pattern(100, 3)).unwrap();
+    fs::write(sony.join("DSC0001.ARW"), pattern(40_000, 4)).unwrap();
+    fs::write(sony.join("DSC0002.JPG"), pattern(40_000, 5)).unwrap(); // not wanted by the Sony profile
+    fs::write(clip.join("C0001.MP4"), pattern(120_000, 6)).unwrap();
+    // identical file names on both cameras must not collide: they go to different folders
+    fs::write(r.src.join("C0001.MP4"), pattern(500, 7)).unwrap();
+
+    let plan = batch_plan(&r);
+    assert_eq!(plan.items.len(), 5, "DJI: mp4+wav+C0001.MP4, Sony: arw+clip");
+    assert_eq!(plan.dest_dirs().len(), 2);
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    assert_eq!(plan.dest_dir, r.dest.join(&day), "batch root is the shared dated folder");
+    engine::preflight(&plan).unwrap();
+
+    let (s, ev) = run(&plan);
+    assert_eq!((s.copied, s.failed, s.renamed), (5, 0, 0), "{:?}", s.failures);
+    let dji = r.dest.join(&day).join("DJI");
+    let son = r.dest.join(&day).join("Sony");
+    assert_eq!(list(&dji), ["C0001.MP4", "DJI_0001.MP4", "DJI_0001.WAV"]);
+    assert_eq!(list(&son), ["C0001.MP4", "DSC0001.ARW"]);
+    assert_eq!(fs::read(dji.join("C0001.MP4")).unwrap(), pattern(500, 7));
+    assert_eq!(fs::read(son.join("C0001.MP4")).unwrap(), pattern(120_000, 6));
+    assert_eq!(fs::read(son.join("DSC0001.ARW")).unwrap(), pattern(40_000, 4));
+    // every event is attributed to a valid plan index, and totals add up
+    let done = ev.iter().filter(|e| matches!(e, Event::Done { .. })).count();
+    assert_eq!(done, 5);
+    let copied: u64 = ev.iter().filter_map(|e| if let Event::Progress { bytes, .. } = e { Some(*bytes) } else { None }).sum();
+    assert_eq!(copied, plan.total_bytes());
+
+    // re-running the batch skips everything
+    let (s2, _) = run(&plan);
+    assert_eq!((s2.copied, s2.skipped), (0, 5));
+}
+
+#[test]
+fn batch_failure_in_one_cameras_folder_does_not_stop_the_other() {
+    let (r, sony, _clip) = batch_rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    fs::write(sony.join("b.arw"), pattern(1000, 2)).unwrap();
+    let plan = batch_plan(&r);
+    // Sabotage the DJI folder: make it a symlink to somewhere else.
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let elsewhere = r._tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(r.dest.join(&day)).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, r.dest.join(&day).join("DJI")).unwrap();
+
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.failed), (1, 1), "{:?}", s.failures);
+    assert!(list(&elsewhere).is_empty(), "nothing leaks through the symlink");
+    assert_eq!(list(&r.dest.join(&day).join("Sony")), ["b.arw"]);
+}
+
+#[test]
+fn batch_preflight_blocks_missing_drive_and_empty_batches() {
+    let (r, sony, _) = batch_rig();
+    fs::write(r.src.join("a.mp4"), pattern(10, 1)).unwrap();
+    fs::write(sony.join("b.arw"), pattern(10, 2)).unwrap();
+    let mut plan = batch_plan(&r);
+    retarget(&mut plan, "/Volumes/definitely-not-mounted-zz/x");
+    assert!(engine::preflight(&plan).unwrap_err().contains("not mounted"));
+    assert!(engine::build_batch_plan(&r.cfg, &[], chrono::Local::now()).is_err());
+}
+
+#[test]
+fn merge_scans_tags_files_and_sources_by_camera() {
+    let (r, sony, clip) = batch_rig();
+    fs::write(r.src.join("a.mp4"), b"1").unwrap();
+    fs::write(sony.join("b.arw"), b"22").unwrap();
+    fs::write(clip.join("c.mp4"), b"333").unwrap();
+    let m = offload::scan::merge_scans((0..2).map(|i| (i, scan_profile(&r.cfg.profiles[i]))).collect());
+    assert_eq!(m.files.len(), 3);
+    assert_eq!(m.files.iter().filter(|f| f.profile == 0).count(), 1);
+    assert_eq!(m.files.iter().filter(|f| f.profile == 1).count(), 2);
+    for f in &m.files {
+        assert_eq!(m.sources[f.source].profile, f.profile, "source index must point at the owning camera's source");
+        assert!(f.path.starts_with(&m.sources[f.source].path));
+    }
+    assert_eq!(m.sources.len(), r.cfg.profiles[0].sources.len() + 2);
 }

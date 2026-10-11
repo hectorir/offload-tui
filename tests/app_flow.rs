@@ -442,10 +442,10 @@ fn dump_frames() {
     let mut app = App::new(cfg, paths);
     app.sys_actions = false;
     let r = &mut app;
-    println!("=====HOME\n{}", render(r, 100, 24));
-    key(r, KeyCode::Enter);
+    println!("=====HOME\n{}", render(r, 100, 34));
+    chr(r, 'b');
     wait_for(r, Screen::Review);
-    println!("=====REVIEW\n{}", render(r, 118, 28));
+    println!("=====REVIEW\n{}", render(r, 122, 34));
     key(r, KeyCode::Enter);
     let t0 = Instant::now();
     loop {
@@ -458,13 +458,167 @@ fn dump_frames() {
             break;
         }
     }
-    println!("=====RUNNING\n{}", render(r, 118, 28));
+    println!("=====RUNNING\n{}", render(r, 122, 34));
     wait_for(r, Screen::Summary);
-    println!("=====SUMMARY\n{}", render(r, 100, 18));
+    println!("=====SUMMARY\n{}", render(r, 100, 22));
     chr(r, 's');
     println!("=====STATS\n{}", render(r, 100, 22));
     key(r, KeyCode::Esc);
     key(r, KeyCode::Enter);
     chr(r, 'e');
     println!("=====SETTINGS\n{}", render(r, 100, 24));
+}
+
+// ---------- batch: both cameras at once ----------
+
+fn batch_rig() -> Rig {
+    let mut r = rig();
+    let sony = r._tmp.path().join("sony/DCIM");
+    let clip = r._tmp.path().join("sony/CLIP");
+    fs::create_dir_all(&sony).unwrap();
+    fs::create_dir_all(&clip).unwrap();
+    r.app.cfg.profiles[1].sources = vec![sony.to_string_lossy().into(), clip.to_string_lossy().into()];
+    r.app.refresh_live();
+    fs::write(r.src.join("DJI_0001.MP4"), vec![1u8; 2_000_000]).unwrap();
+    fs::write(r.src.join("DJI_0002.WAV"), vec![2u8; 300_000]).unwrap();
+    fs::write(sony.join("DSC0001.ARW"), vec![3u8; 1_500_000]).unwrap();
+    fs::write(clip.join("C0001.MP4"), vec![4u8; 3_000_000]).unwrap();
+    r
+}
+
+#[test]
+fn home_shows_a_batch_card_with_live_readiness() {
+    let mut r = batch_rig();
+    let s = render(&mut r.app, 110, 34);
+    assert!(s.contains("Batch · DJI + Sony"), "{s}");
+    assert!(s.contains("all ready"), "{s}");
+    assert!(s.contains("every file verified"));
+    assert!(s.contains("b batch all"), "footer hint");
+    // only one camera connected -> batch card says so
+    let mut r2 = rig(); // Sony source is missing here
+    let s = render(&mut r2.app, 110, 34);
+    assert!(s.contains("1 of 2 ready"), "{s}");
+}
+
+#[test]
+fn batch_flow_review_run_summary_and_history() {
+    let mut r = batch_rig();
+    chr(&mut r.app, 'b');
+    assert_eq!(r.app.screen, Screen::Scanning);
+    wait_for(&mut r.app, Screen::Review);
+    let rv = r.app.review.as_ref().unwrap();
+    assert!(rv.is_batch());
+    assert_eq!(rv.selected_count(), 4);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("Batch · DJI + Sony"), "{s}");
+    assert!(s.contains("Cameras in this batch"));
+    assert!(s.contains("DJI") && s.contains("Sony") && s.contains("DSC0001.ARW") && s.contains("DJI_0001.MP4"));
+    // deselect one Sony file, then run
+    let idx = r.app.review.as_ref().unwrap().scan.files.iter().position(|f| f.path.ends_with("C0001.MP4")).unwrap();
+    r.app.review.as_mut().unwrap().selected[idx] = false;
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Running);
+    let mid = render(&mut r.app, 130, 40);
+    assert!(mid.contains("Batch · DJI + Sony"), "{mid}");
+    wait_for(&mut r.app, Screen::Summary);
+    let s = render(&mut r.app, 130, 40);
+    assert!(s.contains("Batch · DJI + Sony") && s.contains("All files copied and verified"), "{s}");
+    assert!(s.contains("2 copied") && s.contains("1 copied"), "per-camera rows:\n{s}");
+
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let dji = r.dest.join(&day).join("DJI");
+    let son = r.dest.join(&day).join("Sony");
+    assert_eq!(fs::read(dji.join("DJI_0001.MP4")).unwrap(), vec![1u8; 2_000_000]);
+    assert_eq!(fs::read(son.join("DSC0001.ARW")).unwrap(), vec![3u8; 1_500_000]);
+    assert!(!son.join("C0001.MP4").exists(), "deselected file not copied");
+
+    let hist = offload::history::load(&r.paths.history);
+    assert_eq!(hist.len(), 2, "one history record per camera");
+    let mut names: Vec<_> = hist.iter().map(|h| h.profile.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["DJI Osmo Action", "Sony Mirrorless"]);
+    assert_eq!(hist.iter().map(|h| h.copied).sum::<usize>(), 3);
+}
+
+#[test]
+fn batch_with_one_camera_connected_runs_just_that_one_and_says_so() {
+    let mut r = rig(); // DJI present, Sony missing
+    fs::write(r.src.join("DJI_0001.MP4"), vec![1u8; 100_000]).unwrap();
+    chr(&mut r.app, 'b');
+    assert!(r.app.toast.as_ref().unwrap().text.contains("left out of the batch"), "{:?}", r.app.toast);
+    wait_for(&mut r.app, Screen::Review);
+    assert!(!r.app.review.as_ref().unwrap().is_batch(), "a batch of one behaves like a normal run");
+    assert_eq!(r.app.review.as_ref().unwrap().profiles, vec![0]);
+}
+
+#[test]
+fn batch_with_no_cards_stays_home() {
+    let mut r = rig();
+    r.app.cfg.profiles[0].sources = vec!["/definitely/not/here".into()];
+    r.app.refresh_live();
+    chr(&mut r.app, 'b');
+    assert_eq!(r.app.screen, Screen::Home);
+    assert!(r.app.toast.as_ref().unwrap().text.contains("No camera cards"));
+}
+
+#[test]
+fn batch_card_reachable_by_arrows_enter_number_zero_and_mouse() {
+    let mut r = batch_rig();
+    key(&mut r.app, KeyCode::Down);
+    key(&mut r.app, KeyCode::Down);
+    assert_eq!(r.app.home_sel, 2, "profiles 0,1 then the batch card");
+    key(&mut r.app, KeyCode::Down);
+    assert_eq!(r.app.home_sel, 2, "can't go past the batch card");
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Scanning);
+    wait_for(&mut r.app, Screen::Review);
+    assert!(r.app.review.as_ref().unwrap().is_batch());
+
+    let mut r = batch_rig();
+    chr(&mut r.app, '0');
+    wait_for(&mut r.app, Screen::Review);
+    assert!(r.app.review.as_ref().unwrap().is_batch());
+
+    let mut r = batch_rig();
+    render(&mut r.app, 110, 40);
+    let (rect, _) = r.app.hits.iter().find(|(_, h)| *h == Hit::Profile(2)).cloned().unwrap();
+    let click = |x, y| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
+    r.app.on_mouse(click(rect.x + 3, rect.y + 2));
+    assert_eq!(r.app.home_sel, 2);
+    render(&mut r.app, 110, 40);
+    r.app.on_mouse(click(rect.x + 3, rect.y + 2));
+    assert_eq!(r.app.screen, Screen::Scanning);
+}
+
+#[test]
+fn single_profile_config_has_no_batch_card() {
+    let mut r = rig();
+    r.app.cfg.profiles.truncate(1);
+    r.app.refresh_live();
+    assert!(!r.app.has_batch());
+    assert!(!render(&mut r.app, 110, 34).contains("batch"));
+    chr(&mut r.app, 'b'); // ignored
+    assert_eq!(r.app.screen, Screen::Home);
+}
+
+#[test]
+fn batch_screens_render_at_awkward_sizes() {
+    let mut r = batch_rig();
+    let sizes = [(1, 1), (30, 8), (60, 14), (80, 24), (200, 60)];
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    chr(&mut r.app, 'b');
+    wait_for(&mut r.app, Screen::Review);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    key(&mut r.app, KeyCode::Enter);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    wait_for(&mut r.app, Screen::Summary);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
 }

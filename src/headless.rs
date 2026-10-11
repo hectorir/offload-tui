@@ -15,33 +15,80 @@ extern "C" fn on_sigint(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
-/// Returns the process exit code.
-pub fn run(cfg: &Config, profile_name: &str, yes: bool, dry_run: bool, history_path: &Path, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<i32> {
-    let Some(profile) = cfg.find_profile(profile_name) else {
-        let names: Vec<_> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
-        bail!("no profile matching '{}'. Available: {}", profile_name, names.join(", "));
-    };
-    writeln!(out, "Profile: {}", sanitize_display(&profile.name))?;
-    let scan = scan::scan_profile(profile);
-    for s in &scan.sources {
-        writeln!(
-            out,
-            "  {} {}{}",
-            if s.present { "●" } else { "○" },
-            sanitize_display(&s.path.display().to_string()),
-            if s.present { format!("  ({} files)", s.files) } else { "  (not found, skipped)".into() }
-        )?;
+/// Returns the process exit code. One name copies one camera; several names (or `all`) copy a batch.
+pub struct Options<'a> {
+    /// Profile names (partial names work).
+    pub names: &'a [String],
+    /// Include every profile.
+    pub all: bool,
+    pub yes: bool,
+    pub dry_run: bool,
+}
+
+pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<i32> {
+    let Options { names, all, yes, dry_run } = *opts;
+    // Resolve which cameras to include, in config order, without duplicates.
+    let mut idxs: Vec<usize> = vec![];
+    if all {
+        idxs.extend(0..cfg.profiles.len());
     }
+    for n in names {
+        let Some(p) = cfg.find_profile(n) else {
+            let avail: Vec<_> = cfg.profiles.iter().map(|p| p.name.as_str()).collect();
+            bail!("no profile matching '{}'. Available: {}", n, avail.join(", "));
+        };
+        let i = cfg.profiles.iter().position(|q| std::ptr::eq(q, p)).unwrap_or(0);
+        if !idxs.contains(&i) {
+            idxs.push(i);
+        }
+    }
+    if idxs.is_empty() {
+        bail!("name at least one profile, or use --all");
+    }
+    idxs.sort_unstable();
+    let batch = idxs.len() > 1;
+    if batch {
+        let names: Vec<_> = idxs.iter().map(|i| sanitize_display(&cfg.profiles[*i].name)).collect();
+        writeln!(out, "Batch: {}", names.join(" + "))?;
+    }
+
+    let mut parts = vec![];
+    for i in &idxs {
+        let profile = &cfg.profiles[*i];
+        if !batch {
+            writeln!(out, "Profile: {}", sanitize_display(&profile.name))?;
+        }
+        let sc = scan::scan_profile(profile);
+        if batch {
+            writeln!(out, "{}", sanitize_display(&profile.name))?;
+        }
+        for s in &sc.sources {
+            writeln!(
+                out,
+                "  {} {}{}",
+                if s.present { "●" } else { "○" },
+                sanitize_display(&s.path.display().to_string()),
+                if s.present { format!("  ({} files)", s.files) } else { "  (not found, skipped)".into() }
+            )?;
+        }
+        parts.push((*i, sc));
+    }
+    let scan = scan::merge_scans(parts);
     if scan.files.is_empty() {
         writeln!(out, "Nothing to copy.")?;
         return Ok(if scan.any_source_present() { 0 } else { 3 });
     }
-    let refs: Vec<_> = scan.files.iter().collect();
-    let plan = engine::build_plan(cfg, profile, &refs, chrono::Local::now())?;
+    let batch_parts: Vec<engine::BatchPart> = idxs
+        .iter()
+        .map(|i| engine::BatchPart { profile_index: *i, profile: &cfg.profiles[*i], files: scan.files.iter().filter(|f| f.profile == *i).collect() })
+        .filter(|p| !p.files.is_empty())
+        .collect();
+    let plan = engine::build_batch_plan(cfg, &batch_parts, chrono::Local::now())?;
     writeln!(out, "{} files, {} -> {}", plan.items.len(), human_bytes(plan.total_bytes()), sanitize_display(&plan.dest_dir.display().to_string()))?;
     if dry_run {
         for it in &plan.items {
-            writeln!(out, "  would copy {}  ({})", sanitize_display(&it.name), human_bytes(it.size))?;
+            let tag = if batch { format!("[{}] ", sanitize_display(&cfg.profiles[it.group].name)) } else { String::new() };
+            writeln!(out, "  would copy {tag}{}  ({})", sanitize_display(&it.name), human_bytes(it.size))?;
         }
         writeln!(out, "Dry run: nothing was written.")?;
         return Ok(0);
@@ -72,6 +119,7 @@ pub fn run(cfg: &Config, profile_name: &str, yes: bool, dry_run: bool, history_p
     let worker = std::thread::spawn(move || engine::run(&p2, &c2, tx));
     let total = plan.items.len();
     let mut done = 0;
+    let mut outcomes: Vec<Option<Outcome>> = vec![None; total];
     let summary = loop {
         if INTERRUPTED.load(Ordering::SeqCst) {
             ctrl.cancel();
@@ -80,6 +128,8 @@ pub fn run(cfg: &Config, profile_name: &str, yes: bool, dry_run: bool, history_p
             Ok(Event::Done { index, outcome }) => {
                 done += 1;
                 let name = sanitize_display(&plan.items[index].name);
+                let name = if batch { format!("[{}] {name}", sanitize_display(&cfg.profiles[plan.items[index].group].name)) } else { name };
+                outcomes[index] = Some(outcome.clone());
                 let line = match outcome {
                     Outcome::Copied { renamed: true, .. } => format!("verified (name clashed, kept both)  {name}"),
                     Outcome::Copied { .. } => format!("verified   {name}"),
@@ -96,7 +146,55 @@ pub fn run(cfg: &Config, profile_name: &str, yes: bool, dry_run: bool, history_p
         }
     };
     let _ = worker.join();
-    let _ = history::append(history_path, &history::Record::from_summary(&profile.name, &summary, chrono::Local::now()));
+    // One history record per camera (time split by data share so lifetime stats don't double-count).
+    let mut per: Vec<(usize, usize, usize, usize, u64)> = idxs.iter().map(|i| (*i, 0, 0, 0, 0)).collect();
+    for (it, st) in plan.items.iter().zip(&outcomes) {
+        if let Some(e) = per.iter_mut().find(|e| e.0 == it.group) {
+            match st {
+                Some(Outcome::Copied { .. }) => {
+                    e.1 += 1;
+                    e.4 += it.size;
+                }
+                Some(Outcome::Skipped { .. }) => e.2 += 1,
+                Some(Outcome::Failed(_)) => e.3 += 1,
+                _ => {}
+            }
+        }
+    }
+    let all_bytes: u64 = per.iter().map(|e| e.4).sum();
+    for (i, copied, skipped, failed, bytes) in &per {
+        if plan.items.iter().all(|it| it.group != *i) {
+            continue;
+        }
+        let share = if all_bytes > 0 { *bytes as f64 / all_bytes as f64 } else { 1.0 / per.len() as f64 };
+        let dir = plan.items.iter().find(|it| it.group == *i).map(|it| it.dest_dir.display().to_string()).unwrap_or_default();
+        let rec = history::Record {
+            when: chrono::Local::now(),
+            profile: cfg.profiles[*i].name.clone(),
+            dest: dir,
+            copied: *copied,
+            skipped: *skipped,
+            failed: *failed,
+            bytes: *bytes,
+            secs: (summary.elapsed.as_secs_f64() * share).round() as u64,
+            cancelled: summary.cancelled,
+        };
+        let _ = history::append(history_path, &rec);
+    }
+    if batch {
+        writeln!(out)?;
+        for (i, copied, skipped, failed, bytes) in &per {
+            writeln!(
+                out,
+                "  {:<20} {} copied ({}), {} skipped, {} failed",
+                sanitize_display(&cfg.profiles[*i].name),
+                copied,
+                human_bytes(*bytes),
+                skipped,
+                failed
+            )?;
+        }
+    }
     let rate = if summary.elapsed.as_secs_f64() > 0.5 {
         format!(" ({})", human_rate(summary.bytes_copied as f64 / summary.elapsed.as_secs_f64()))
     } else {

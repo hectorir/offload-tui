@@ -95,7 +95,14 @@ fn hints<'a>(t: &Theme, items: &[(&str, &str)]) -> Line<'a> {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let t = &app.theme;
     let line = match app.screen {
-        Screen::Home => hints(t, &[("↑↓", "choose"), ("enter", "start"), ("e", "settings"), ("s", "stats"), ("t", "theme"), ("?", "help"), ("q", "quit")]),
+        Screen::Home => {
+            let mut h = vec![("↑↓", "choose"), ("enter", "start")];
+            if app.has_batch() {
+                h.push(("b", "batch all"));
+            }
+            h.extend([("e", "settings"), ("s", "stats"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
+            hints(t, &h)
+        }
         Screen::Scanning => hints(t, &[("esc", "cancel")]),
         Screen::Review => hints(t, &[("space", "toggle"), ("a", "all/none"), ("tab", "dates"), ("enter", "copy"), ("esc", "back"), ("?", "help")]),
         Screen::Running => match &app.run {
@@ -198,21 +205,28 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(note).alignment(Alignment::Right), Rect { y: head.y + 1, height: 1, ..head });
     }
 
-    // profile cards
-    const CARD_H: u16 = 6;
+    // profile cards (+ the batch card when there are two or more cameras)
+    const CARD_H: u16 = 7;
+    let n_prof = app.cfg.profiles.len();
+    let total_items = app.home_items();
     let visible = (mid.height / CARD_H).max(1) as usize;
     if app.home_sel < app.home_scroll {
         app.home_scroll = app.home_sel;
     } else if app.home_sel >= app.home_scroll + visible {
         app.home_scroll = app.home_sel + 1 - visible;
     }
-    for (slot, idx) in (app.home_scroll..app.cfg.profiles.len()).take(visible).enumerate() {
+    for (slot, idx) in (app.home_scroll..total_items).take(visible).enumerate() {
         let r = Rect { x: mid.x, y: mid.y + slot as u16 * CARD_H, width: mid.width, height: CARD_H.min(mid.height.saturating_sub(slot as u16 * CARD_H)) };
         if r.height < 3 {
             break;
         }
-        let p = &app.cfg.profiles[idx];
         let selected = idx == app.home_sel;
+        if idx == n_prof {
+            draw_batch_card(f, app, r, selected);
+            app.hits.push((r, Hit::Profile(idx)));
+            continue;
+        }
+        let p = &app.cfg.profiles[idx];
         let live = app.live.get(idx).cloned().unwrap_or_default();
         let srcs = p.source_paths();
         let n_present = live.present.iter().filter(|x| **x).count();
@@ -234,11 +248,11 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect) {
             ]));
         let inner = blk.inner(r);
         f.render_widget(blk, r);
-        let logo = widgets::logo(&p.icon);
-        let logo_lines: Vec<Line> = logo.iter().map(|l| Line::from(Span::styled(*l, Style::default().fg(if selected { t.accent } else { t.dim })))).collect();
-        f.render_widget(Paragraph::new(logo_lines), Rect { x: inner.x + 1, width: 11.min(inner.width), ..inner });
-        let tx = inner.x + 13;
-        let tw = inner.width.saturating_sub(14);
+        let art = widgets::logo(&p.icon);
+        let lw = widgets::logo_width(&art) as u16;
+        f.render_widget(Paragraph::new(widgets::logo_lines(&art, &t, selected)), Rect { x: inner.x + 1, width: lw.min(inner.width), ..inner });
+        let tx = inner.x + lw + 3;
+        let tw = inner.width.saturating_sub(lw + 4);
         let mut src_spans = vec![];
         for (i, s) in srcs.iter().enumerate() {
             let on = live.present.get(i).copied().unwrap_or(false);
@@ -253,6 +267,7 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let dest_name = if p.subfolder.is_empty() { "<date>/".to_string() } else { format!("<date>/{}/", p.subfolder) };
         let rows = vec![
+            Line::from(""),
             Line::from(vec![
                 Span::styled(trunc(&sanitize_display(&p.name), tw as usize / 2), bold(&t).add_modifier(Modifier::BOLD)),
                 Span::raw("   "),
@@ -265,8 +280,8 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(rows), Rect { x: tx, y: inner.y, width: tw, height: inner.height });
         app.hits.push((r, Hit::Profile(idx)));
     }
-    if app.cfg.profiles.len() > visible {
-        let s = format!("{}/{}", app.home_sel + 1, app.cfg.profiles.len());
+    if total_items > visible {
+        let s = format!("{}/{}", app.home_sel + 1, total_items);
         f.render_widget(
             Paragraph::new(Span::styled(s, dim(&t))).alignment(Alignment::Right),
             Rect { y: mid.y + mid.height.saturating_sub(1), height: 1, ..mid },
@@ -285,11 +300,68 @@ fn draw_home(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Short label for a camera in tags and titles: its subfolder name, else its name.
+fn short_name(p: &crate::config::Profile) -> String {
+    let s = if p.subfolder.is_empty() { &p.name } else { &p.subfolder };
+    sanitize_display(s)
+}
+
+fn profile_color(t: &Theme, slot: usize) -> ratatui::style::Color {
+    [t.accent, t.accent2, t.ok, t.warn][slot % 4]
+}
+
+fn draw_batch_card(f: &mut Frame, app: &App, r: Rect, selected: bool) {
+    let t = app.theme;
+    let n = app.cfg.profiles.len();
+    let connected = app.connected_profiles();
+    let (status, status_c) = if connected.len() == n {
+        ("● all ready".to_string(), t.ok)
+    } else if connected.is_empty() {
+        ("○ no cards detected".to_string(), t.dim)
+    } else {
+        (format!("◐ {} of {} ready", connected.len(), n), t.warn)
+    };
+    let border = if selected { t.accent2 } else { t.border };
+    let blk = Block::bordered().border_type(if selected { BorderType::Thick } else { BorderType::Rounded }).border_style(Style::default().fg(border)).title(
+        Line::from(vec![Span::raw(" "), Span::styled("b", Style::default().fg(t.accent2).add_modifier(Modifier::BOLD)), Span::styled(" · batch ", dim(&t))]),
+    );
+    let inner = blk.inner(r);
+    f.render_widget(blk, r);
+    let art = widgets::logo_batch();
+    let lw = widgets::logo_width(&art) as u16;
+    f.render_widget(Paragraph::new(widgets::logo_lines(&art, &t, selected)), Rect { x: inner.x + 1, width: lw.min(inner.width), ..inner });
+    let tx = inner.x + lw + 3;
+    let tw = inner.width.saturating_sub(lw + 4);
+    let names: Vec<String> = app.cfg.profiles.iter().map(short_name).collect();
+    let mut cams = vec![];
+    for (i, p) in app.cfg.profiles.iter().enumerate() {
+        let on = connected.contains(&i);
+        cams.push(Span::styled(if on { "● " } else { "○ " }, Style::default().fg(if on { t.ok } else { t.dim })));
+        cams.push(Span::styled(format!("{}   ", trunc(&sanitize_display(&p.name), 24)), if on { fg(&t) } else { dim(&t) }));
+    }
+    let into: Vec<String> = app.cfg.profiles.iter().map(|p| if p.subfolder.is_empty() { "<date>/".to_string() } else { format!("{}/", p.subfolder) }).collect();
+    let rows = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(trunc(&format!("Batch · {}", names.join(" + ")), tw as usize / 2), bold(&t)),
+            Span::raw("   "),
+            Span::styled(status, Style::default().fg(status_c)),
+        ]),
+        Line::from(cams),
+        Line::from(Span::styled("one review · one copy · every file verified", dim(&t))),
+        Line::from(vec![
+            Span::styled("into   ", dim(&t)),
+            Span::styled(trunc(&sanitize_display(&format!("<date>/ {}", into.join(" + "))), tw as usize), fg(&t)),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(rows), Rect { x: tx, y: inner.y, width: tw, height: inner.height });
+}
+
 // ---------- scanning ----------
 
 fn draw_scanning(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
-    let name = app.cfg.profiles.get(app.scan_profile).map(|p| p.name.clone()).unwrap_or_default();
+    let name = app.scan_profiles.iter().filter_map(|i| app.cfg.profiles.get(*i)).map(|p| p.name.clone()).collect::<Vec<_>>().join(" + ");
     let mid = Rect { y: area.y + area.height / 3, height: 3, ..area };
     let lines = vec![
         Line::from(vec![
@@ -316,12 +388,16 @@ fn check(sel: usize, tot: usize) -> &'static str {
 fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
     let Some(rv) = &app.review else { return };
-    let profile = app.cfg.profiles.get(rv.profile).cloned();
     let [left, right] = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(area);
     let [files_a, peek_a] = Layout::vertical([Constraint::Min(5), Constraint::Length(5)]).areas(left);
 
     // files
-    let pname = profile.as_ref().map(|p| sanitize_display(&p.name)).unwrap_or_default();
+    let names: Vec<String> = rv.profiles.iter().filter_map(|i| app.cfg.profiles.get(*i)).map(short_name).collect();
+    let pname = if rv.is_batch() {
+        format!("Batch · {}", names.join(" + "))
+    } else {
+        rv.profiles.first().and_then(|i| app.cfg.profiles.get(*i)).map(|p| sanitize_display(&p.name)).unwrap_or_default()
+    };
     let blk = block(
         &t,
         Line::from(vec![
@@ -344,19 +420,24 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         let on = rv.selected[i];
         let name = sanitize_display(&fe.path.file_name().unwrap_or_default().to_string_lossy());
         let is_cur = i == rv.cursor && rv.focus == Focus::Files;
-        let namew = (inner.width as usize).saturating_sub(34);
+        let namew = (inner.width as usize).saturating_sub(if rv.is_batch() { 40 } else { 34 });
         let mut style = if on { fg(&t) } else { dim(&t) };
         if is_cur {
             style = style.bg(t.sel_bg).add_modifier(Modifier::BOLD);
         }
         let mark = if rv.present[i] { Span::styled(" on dest", Style::default().fg(t.ok)) } else { Span::raw("") };
         let date = DateTime::<Local>::from(fe.modified).format("%b %d %H:%M").to_string();
-        let mut spans = vec![
-            Span::styled(if on { "[x] " } else { "[ ] " }, if on { Style::default().fg(t.ok) } else { dim(&t) }),
+        let mut spans = vec![Span::styled(if on { "[x] " } else { "[ ] " }, if on { Style::default().fg(t.ok) } else { dim(&t) })];
+        if rv.is_batch() {
+            let slot = rv.profiles.iter().position(|p| *p == fe.profile).unwrap_or(0);
+            let tag = app.cfg.profiles.get(fe.profile).map(short_name).unwrap_or_default();
+            spans.push(Span::styled(format!("{:<5} ", trunc(&tag, 5)), Style::default().fg(profile_color(&t, slot)).add_modifier(Modifier::BOLD)));
+        }
+        spans.extend([
             Span::styled(format!("{:<w$}", trunc(&name, namew), w = namew), style),
             Span::styled(format!(" {:>9}", human_bytes(fe.size)), style),
             Span::styled(format!("  {date}"), if is_cur { style } else { dim(&t) }),
-        ];
+        ]);
         spans.push(mark);
         lines.push(Line::from(spans));
         hits.push((Rect { x: inner.x, y: inner.y + row as u16, width: inner.width, height: 1 }, Hit::File(i)));
@@ -390,8 +471,15 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     // right column
     let n_src = rv.scan.sources.len() as u16;
     let n_types = rv.scan.by_ext().len() as u16;
-    let [sum_a, src_a, typ_a, date_a] =
-        Layout::vertical([Constraint::Length(8), Constraint::Length(n_src + 2), Constraint::Length(n_types.max(1) + 2), Constraint::Min(4)]).areas(right);
+    let cams_h = if rv.is_batch() { rv.profiles.len() as u16 + 2 } else { 0 };
+    let [sum_a, cams_a, src_a, typ_a, date_a] = Layout::vertical([
+        Constraint::Length(8),
+        Constraint::Length(cams_h),
+        Constraint::Length(n_src + 2),
+        Constraint::Length(n_types.max(1) + 2),
+        Constraint::Min(4),
+    ])
+    .areas(right);
 
     let blk = block(&t, title(&t, "Ready to copy"));
     let si = blk.inner(sum_a);
@@ -423,6 +511,27 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         sl.push(Line::from(Span::styled("press enter to copy + verify", Style::default().fg(t.ok))));
     }
     f.render_widget(Paragraph::new(sl).wrap(Wrap { trim: true }), si);
+
+    if rv.is_batch() {
+        let blk = block(&t, title(&t, "Cameras in this batch"));
+        let ci = blk.inner(cams_a);
+        f.render_widget(blk, cams_a);
+        let cl: Vec<Line> = rv
+            .profiles
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, pi)| {
+                let p = app.cfg.profiles.get(*pi)?;
+                let (sel, tot, bytes) = rv.profile_counts(*pi);
+                Some(Line::from(vec![
+                    Span::styled("● ", Style::default().fg(profile_color(&t, slot))),
+                    Span::styled(format!("{:<8}", trunc(&short_name(p), 8)), bold(&t)),
+                    Span::styled(format!("{sel:>3}/{tot:<3} files  {:>9}", human_bytes(bytes)), if sel > 0 { fg(&t) } else { dim(&t) }),
+                ]))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(cl), ci);
+    }
 
     let blk = block(&t, title(&t, "Sources"));
     let ii = blk.inner(src_a);
@@ -529,7 +638,12 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
     let frame = app.tick_count / 2;
     let Some(run) = &app.run else { return };
-    let pname = app.cfg.profiles.get(run.profile).map(|p| sanitize_display(&p.name)).unwrap_or_default();
+    let batch = run.profiles.len() > 1;
+    let pname = if batch {
+        format!("Batch · {}", run.profiles.iter().filter_map(|i| app.cfg.profiles.get(*i)).map(short_name).collect::<Vec<_>>().join(" + "))
+    } else {
+        run.profiles.first().and_then(|i| app.cfg.profiles.get(*i)).map(|p| sanitize_display(&p.name)).unwrap_or_default()
+    };
     let paused = run.ctrl.is_paused();
     let copy_done = run.copied >= run.total;
     let (phase, phase_c) = if run.ctrl.is_cancelled() {
@@ -541,7 +655,8 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         ("COPYING", t.accent)
     };
-    let [top, mid, list_a] = Layout::vertical([Constraint::Length(6), Constraint::Length(5), Constraint::Min(4)]).areas(area);
+    let top_h = 6 + if batch { run.profiles.len().min(4) as u16 } else { 0 };
+    let [top, mid, list_a] = Layout::vertical([Constraint::Length(top_h), Constraint::Length(5), Constraint::Min(4)]).areas(area);
 
     // progress block
     let blk = block(
@@ -566,7 +681,7 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(v)
     };
     let eta = run.eta().map(|d| human_duration(d.as_secs())).unwrap_or_else(|| "-".into());
-    let lines = vec![
+    let mut lines = vec![
         mk("copy", run.copied),
         mk("verify", run.verified),
         Line::from(vec![
@@ -580,6 +695,35 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(human_duration(run.elapsed().as_secs()), fg(&t)),
         ]),
     ];
+    if batch {
+        // One line per camera: blended copy+verify progress, so you can see which card is being worked on.
+        for (slot, pi) in run.profiles.iter().enumerate().take(4) {
+            let Some(p) = app.cfg.profiles.get(*pi) else { continue };
+            let (mut total, mut done, mut files, mut files_done) = (0u64, 0f64, 0usize, 0usize);
+            for (item, st) in run.plan.items.iter().zip(&run.state) {
+                if item.group != *pi {
+                    continue;
+                }
+                files += 1;
+                total += item.size;
+                done += match st {
+                    ItemState::Copied { .. } | ItemState::Skipped | ItemState::Failed(_) => item.size as f64,
+                    ItemState::Copying(b) => *b as f64 / 2.0,
+                    ItemState::Verifying(b) => item.size as f64 / 2.0 + *b as f64 / 2.0,
+                    _ => 0.0,
+                };
+                if st.is_final() {
+                    files_done += 1;
+                }
+            }
+            let ratio = if total > 0 { done / total as f64 } else { 1.0 };
+            let mut v =
+                vec![Span::styled(format!("{:<7}", trunc(&short_name(p), 6)), Style::default().fg(profile_color(&t, slot)).add_modifier(Modifier::BOLD))];
+            v.extend(gradient_bar(bar_w.min(40), ratio, &t));
+            v.push(Span::styled(format!(" {:>3.0}%  {files_done}/{files} files · {}", ratio * 100.0, human_bytes(total)), fg(&t)));
+            lines.push(Line::from(v));
+        }
+    }
     f.render_widget(Paragraph::new(lines), inner);
 
     // throughput + storage
@@ -625,12 +769,16 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
         let item = &run.plan.items[i];
         let (icon, cells) = state_cells(&t, &run.state[i], item.size, frame, barw);
         let active = matches!(run.state[i], ItemState::Copying(_) | ItemState::Verifying(_));
-        let mut spans = vec![
-            icon,
-            Span::raw(" "),
+        let mut spans = vec![icon, Span::raw(" ")];
+        if batch {
+            let slot = run.profiles.iter().position(|p| *p == item.group).unwrap_or(0);
+            let tag = app.cfg.profiles.get(item.group).map(short_name).unwrap_or_default();
+            spans.push(Span::styled(format!("{:<5} ", trunc(&tag, 5)), Style::default().fg(profile_color(&t, slot))));
+        }
+        spans.extend([
             Span::styled(format!("{:<w$}", trunc(&sanitize_display(&item.name), namew), w = namew), if active { bold(&t) } else { fg(&t) }),
             Span::styled(format!(" {:>9}  ", human_bytes(item.size)), dim(&t)),
-        ];
+        ]);
         spans.extend(cells);
         lines.push(Line::from(spans));
     }
@@ -642,8 +790,13 @@ fn draw_running(f: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
     let t = app.theme;
-    let Some((pi, s)) = &app.summary else { return };
-    let pname = app.cfg.profiles.get(*pi).map(|p| sanitize_display(&p.name)).unwrap_or_default();
+    let Some((pids, s)) = &app.summary else { return };
+    let batch = pids.len() > 1;
+    let pname = if batch {
+        format!("Batch · {}", pids.iter().filter_map(|i| app.cfg.profiles.get(*i)).map(short_name).collect::<Vec<_>>().join(" + "))
+    } else {
+        pids.first().and_then(|i| app.cfg.profiles.get(*i)).map(|p| sanitize_display(&p.name)).unwrap_or_default()
+    };
     let (icon, head, c) = if s.cancelled {
         ("■", "Cancelled", t.warn)
     } else if s.failed > 0 {
@@ -652,7 +805,7 @@ fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
         ("✓", "All files copied and verified", t.ok)
     };
     let w = area.width.min(90);
-    let h = (14 + s.failures.len().min(8) as u16).min(area.height);
+    let h = (14 + s.failures.len().min(8) as u16 + if batch { pids.len() as u16 + 1 } else { 0 }).min(area.height);
     let a = Rect { x: area.x + (area.width - w) / 2, y: area.y + area.height.saturating_sub(h) / 3, width: w, height: h };
     let blk = Block::bordered().border_type(BorderType::Rounded).border_style(Style::default().fg(c)).title(title(&t, &pname));
     let inner = blk.inner(a);
@@ -681,6 +834,26 @@ fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
         ]),
         Line::from(""),
     ];
+    if batch {
+        for (slot, pp) in app.per_profile.iter().enumerate() {
+            let Some(p) = app.cfg.profiles.get(pp.profile) else { continue };
+            let (mark, mc) = if pp.failed > 0 {
+                ("✗", t.err)
+            } else if pp.copied + pp.skipped < pp.total {
+                ("■", t.warn)
+            } else {
+                ("✓", t.ok)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(mc)),
+                Span::styled(format!("{:<8}", trunc(&short_name(p), 8)), Style::default().fg(profile_color(&t, slot)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{} copied · {}", pp.copied, human_bytes(pp.bytes)), bold(&t)),
+                Span::styled(if pp.skipped > 0 { format!("  {} skipped", pp.skipped) } else { String::new() }, dim(&t)),
+                Span::styled(if pp.failed > 0 { format!("  {} FAILED", pp.failed) } else { String::new() }, Style::default().fg(t.err)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
     if s.failed == 0 && !s.cancelled {
         lines.push(Line::from(Span::styled("Every copied file was re-read from disk and matched its source checksum.", dim(&t))));
         lines.push(Line::from(Span::styled("Nothing was deleted from the card.", dim(&t))));
@@ -848,7 +1021,7 @@ fn draw_stats(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_help(f: &mut Frame, app: &App, full: Rect) {
     let t = app.theme;
     let w = 64.min(full.width);
-    let h = 24.min(full.height);
+    let h = 25.min(full.height);
     let a = Rect { x: full.x + (full.width - w) / 2, y: full.y + (full.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, a);
     let blk = Block::bordered().border_type(BorderType::Double).border_style(Style::default().fg(t.accent)).title(title(&t, "Keys"));
@@ -862,6 +1035,7 @@ fn draw_help(f: &mut Frame, app: &App, full: Rect) {
         sec("Home"),
         kv("↑ ↓ / j k", "choose a camera profile (or press 1-9)"),
         kv("enter", "scan the card"),
+        kv("b  (or 0)", "batch: every connected camera at once"),
         kv("e  s  t", "settings · stats · cycle theme"),
         sec("Review"),
         kv("space", "include / exclude a file or a whole day"),

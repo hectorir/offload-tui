@@ -1,8 +1,8 @@
 //! Custom widgets: gradient bars, text bars, logos, spinners.
 
 use crate::theme::{Theme, lerp};
-use ratatui::style::{Color, Style};
-use ratatui::text::Span;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 const EIGHTHS: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -37,12 +37,61 @@ pub fn solid_bar(width: usize, ratio: f64, color: Color) -> Span<'static> {
     Span::styled(s, Style::default().fg(color))
 }
 
-pub fn logo(icon: &str) -> [&'static str; 4] {
+/// Height of every logo, in rows.
+pub const LOGO_H: usize = 5;
+
+/// Line art for a camera icon. `action` is a DJI Osmo Action (square body, big lens, front screen);
+/// `mirrorless` is a Sony ZV-E1 (compact body, deep grip, windscreen, big E-mount lens, tally light).
+pub fn logo(icon: &str) -> [&'static str; LOGO_H] {
     match icon {
-        "action" => ["        ", "┌─────┐▪", "│  ◉  │ ", "└─────┘ "],
-        "mirrorless" => ["   ▄▄▄  ", "╭───────╮", "│  (◉)  │", "╰───────╯"],
-        _ => ["  ┌▀▀┐  ", "┌─┴──┴─┐", "│  ◎   │", "└──────┘"],
+        "action" | "osmo" => ["  ▁▂▁      ", "┏━━━━━━━━┓ ", "┃ ╭────╮▫┃ ", "┃ │(◉) │ ┃ ", "┗━╰────╯▬┛ "],
+        "mirrorless" | "zv-e1" | "zve1" => ["   ▂▇▇▇▂    ●", "╭────────╮▗▖ ", "│ ╭────╮ │██ ", "│ │(◎) │ │██ ", "╰─╰────╯─╯▀▀ "],
+        _ => ["  ┌▀▀┐   ", "┌─┴──┴──┐", "│ ╭──╮ ▫│", "│ │ ◎│  │", "└─╰──╯──┘"],
     }
+}
+
+/// Two cameras side by side, for the batch card.
+pub fn logo_batch() -> [&'static str; LOGO_H] {
+    [" ▁▂▁     ▂▇▇▂    ", "┏━━━━┓  ╭────╮▗  ", "┃(◉) ┃ +│(◎) │█  ", "┗━━━━┛  ╰────╯▀  ", "                 "]
+}
+
+/// Display width of a logo in cells.
+pub fn logo_width(art: &[&str]) -> usize {
+    art.iter().map(|l| l.chars().count()).max().unwrap_or(0)
+}
+
+fn glyph_style(c: char, t: &Theme, selected: bool) -> Style {
+    match c {
+        '◉' | '◎' => Style::default().fg(t.accent2).add_modifier(Modifier::BOLD), // the glass
+        '●' => Style::default().fg(t.err),                                        // tally light
+        '▁' | '▂' | '▃' | '▅' | '▆' | '▇' | '█' | '▗' | '▖' | '▐' | '▀' | '▄' | '▫' | '▬' | '+' => {
+            Style::default().fg(if selected { t.fg } else { t.dim })
+        }
+        _ => Style::default().fg(if selected { t.accent } else { t.dim }),
+    }
+}
+
+/// Render logo art with per-glyph colors (lens, tally light, grip/accessories, body).
+pub fn logo_lines(art: &[&'static str], t: &Theme, selected: bool) -> Vec<Line<'static>> {
+    art.iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = vec![];
+            let mut cur = String::new();
+            let mut cur_style: Option<Style> = None;
+            for c in row.chars() {
+                let st = glyph_style(c, t, selected);
+                if cur_style != Some(st) && !cur.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut cur), cur_style.unwrap_or_default()));
+                }
+                cur_style = Some(st);
+                cur.push(c);
+            }
+            if !cur.is_empty() {
+                spans.push(Span::styled(cur, cur_style.unwrap_or_default()));
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 pub fn spinner(frame: usize) -> &'static str {
@@ -79,9 +128,26 @@ mod tests {
     }
 
     #[test]
-    fn logos_have_consistent_height() {
+    fn logos_have_consistent_height_and_are_distinct() {
         for i in ["action", "mirrorless", "camera", "zzz"] {
-            assert_eq!(logo(i).len(), 4);
+            assert_eq!(logo(i).len(), LOGO_H);
+        }
+        assert_eq!(logo_batch().len(), LOGO_H);
+        assert_ne!(logo("action"), logo("mirrorless"));
+        assert_ne!(logo("action"), logo("camera"));
+        assert_eq!(logo("osmo"), logo("action"));
+        assert_eq!(logo("zv-e1"), logo("mirrorless"));
+    }
+
+    #[test]
+    fn colored_logo_preserves_every_character() {
+        let t = Theme::by_name("nord");
+        for art in [logo("action"), logo("mirrorless"), logo("camera"), logo_batch()] {
+            let lines = logo_lines(&art, &t, true);
+            for (row, line) in art.iter().zip(&lines) {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                assert_eq!(&text, row);
+            }
         }
     }
 }

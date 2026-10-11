@@ -73,7 +73,10 @@ pub enum Focus {
 }
 
 pub struct Review {
-    pub profile: usize,
+    /// Cameras in this review (one for a single camera, several for a batch).
+    pub profiles: Vec<usize>,
+    /// Destination folder per camera.
+    pub dirs: Vec<(usize, PathBuf)>,
     pub scan: ScanResult,
     pub selected: Vec<bool>,
     /// Same-size file already at the destination (confirmed by checksum during the copy).
@@ -83,12 +86,34 @@ pub struct Review {
     pub dates: Vec<NaiveDate>,
     pub date_cursor: usize,
     pub focus: Focus,
+    /// Folder shown to the user: the camera's folder, or the shared dated folder for a batch.
     pub dest_dir: PathBuf,
     pub dest: DestLive,
     pub error: Option<String>,
 }
 
 impl Review {
+    pub fn is_batch(&self) -> bool {
+        self.profiles.len() > 1
+    }
+    pub fn dir_for(&self, profile: usize) -> Option<&PathBuf> {
+        self.dirs.iter().find(|(p, _)| *p == profile).map(|(_, d)| d)
+    }
+    pub fn profile_counts(&self, profile: usize) -> (usize, usize, u64) {
+        let mut sel = 0;
+        let mut tot = 0;
+        let mut bytes = 0;
+        for (f, s) in self.scan.files.iter().zip(&self.selected) {
+            if f.profile == profile {
+                tot += 1;
+                if *s {
+                    sel += 1;
+                    bytes += f.size;
+                }
+            }
+        }
+        (sel, tot, bytes)
+    }
     pub fn selected_count(&self) -> usize {
         self.selected.iter().filter(|s| **s).count()
     }
@@ -149,7 +174,7 @@ impl ItemState {
 }
 
 pub struct Run {
-    pub profile: usize,
+    pub profiles: Vec<usize>,
     pub plan: Plan,
     pub state: Vec<ItemState>,
     pub copied: u64,
@@ -239,6 +264,17 @@ pub enum Hit {
     Row(usize),
 }
 
+/// One camera's results after a run (shown in the summary and written to history).
+#[derive(Clone, Debug, Default)]
+pub struct PerProfile {
+    pub profile: usize,
+    pub total: usize,
+    pub copied: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub bytes: u64,
+}
+
 pub struct StatsView {
     pub records: Vec<Record>,
     pub stats: history::Stats,
@@ -258,11 +294,12 @@ pub struct App {
     pub live: Vec<ProfileLive>,
     pub dest_live: DestLive,
     pub last_live: Instant,
-    pub scan_rx: Option<Receiver<(usize, ScanResult)>>,
-    pub scan_profile: usize,
+    pub scan_rx: Option<Receiver<(Vec<usize>, ScanResult)>>,
+    pub scan_profiles: Vec<usize>,
     pub review: Option<Review>,
     pub run: Option<Run>,
-    pub summary: Option<(usize, Summary)>,
+    pub summary: Option<(Vec<usize>, Summary)>,
+    pub per_profile: Vec<PerProfile>,
     pub eject_confirm: Option<Vec<PathBuf>>,
     pub editor: Editor,
     pub stats: Option<StatsView>,
@@ -295,10 +332,11 @@ impl App {
             dest_live: DestLive::default(),
             last_live: Instant::now() - Duration::from_secs(10),
             scan_rx: None,
-            scan_profile: 0,
+            scan_profiles: vec![],
             review: None,
             run: None,
             summary: None,
+            per_profile: vec![],
             eject_confirm: None,
             editor: Editor::default(),
             stats: None,
@@ -322,14 +360,29 @@ impl App {
         self.live = self.cfg.profiles.iter().map(|p| ProfileLive { present: p.source_paths().iter().map(|s| s.is_dir()).collect() }).collect();
         self.dest_live = dest_live(&self.cfg.destination_path());
         self.last_live = Instant::now();
-        if self.home_sel >= self.cfg.profiles.len() {
-            self.home_sel = self.cfg.profiles.len().saturating_sub(1);
+        let items = self.home_items();
+        if self.home_sel >= items {
+            self.home_sel = items.saturating_sub(1);
         }
     }
 
     pub fn set_theme(&mut self, name: &str) {
         self.theme = Theme::by_name(name);
         save_theme_pref(&self.paths.state, self.theme.name);
+    }
+
+    /// Number of selectable rows on the home screen (profiles, plus the batch card when there are 2+).
+    pub fn home_items(&self) -> usize {
+        self.cfg.profiles.len() + usize::from(self.has_batch())
+    }
+
+    pub fn has_batch(&self) -> bool {
+        self.cfg.profiles.len() >= 2
+    }
+
+    /// Profiles whose cards are currently plugged in.
+    pub fn connected_profiles(&self) -> Vec<usize> {
+        (0..self.cfg.profiles.len()).filter(|i| self.live.get(*i).map(|l| l.present.iter().any(|p| *p)).unwrap_or(false)).collect()
     }
 
     fn profile(&self, i: usize) -> Option<&Profile> {
@@ -363,9 +416,9 @@ impl App {
     fn poll_scan(&mut self) {
         let Some(rx) = &self.scan_rx else { return };
         match rx.try_recv() {
-            Ok((idx, scan)) => {
+            Ok((idxs, scan)) => {
                 self.scan_rx = None;
-                self.on_scan_done(idx, scan);
+                self.on_scan_done(idxs, scan);
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.scan_rx = None;
@@ -376,18 +429,28 @@ impl App {
         }
     }
 
-    fn on_scan_done(&mut self, idx: usize, scan: ScanResult) {
-        let Some(profile) = self.profile(idx).cloned() else { return };
-        let dest_dir = engine::build_plan(&self.cfg, &profile, &[], Local::now()).map(|p| p.dest_dir).unwrap_or_default();
+    fn on_scan_done(&mut self, profiles: Vec<usize>, scan: ScanResult) {
+        let now = Local::now();
+        let Ok(date) = self.cfg.render_date(now) else { return };
+        let dirs: Vec<(usize, PathBuf)> =
+            profiles.iter().filter_map(|i| self.profile(*i).map(|p| (*i, engine::profile_dest_dir(&self.cfg, p, &date)))).collect();
+        let Some(first) = dirs.first() else { return };
+        let dest_dir = if dirs.len() == 1 { first.1.clone() } else { self.profile(first.0).map(|p| self.cfg.dest_base_for(p).join(&date)).unwrap_or_default() };
         let present = scan
             .files
             .iter()
-            .map(|f| std::fs::symlink_metadata(dest_dir.join(f.path.file_name().unwrap_or_default())).map(|m| m.len() == f.size).unwrap_or(false))
+            .map(|f| {
+                dirs.iter()
+                    .find(|(p, _)| *p == f.profile)
+                    .map(|(_, d)| std::fs::symlink_metadata(d.join(f.path.file_name().unwrap_or_default())).map(|m| m.len() == f.size).unwrap_or(false))
+                    .unwrap_or(false)
+            })
             .collect();
         let dates: Vec<NaiveDate> = scan.by_date().keys().copied().collect();
         let n = scan.files.len();
         self.review = Some(Review {
-            profile: idx,
+            profiles,
+            dirs,
             selected: vec![true; n],
             present,
             cursor: 0,
@@ -482,9 +545,45 @@ impl App {
 
     fn finish_run(&mut self, s: Summary) {
         let Some(run) = self.run.take() else { return };
-        let name = self.profile(run.profile).map(|p| p.name.clone()).unwrap_or_default();
-        let _ = history::append(&self.paths.history, &Record::from_summary(&name, &s, Local::now()));
+        let now = Local::now();
+        // Per-camera results, derived from what happened to each file.
+        let mut per: Vec<PerProfile> = run.profiles.iter().map(|p| PerProfile { profile: *p, ..Default::default() }).collect();
+        for (item, st) in run.plan.items.iter().zip(&run.state) {
+            if let Some(pp) = per.iter_mut().find(|pp| pp.profile == item.group) {
+                pp.total += 1;
+                match st {
+                    ItemState::Copied { .. } => {
+                        pp.copied += 1;
+                        pp.bytes += item.size;
+                    }
+                    ItemState::Skipped => pp.skipped += 1,
+                    ItemState::Failed(_) => pp.failed += 1,
+                    _ => {}
+                }
+            }
+        }
+        // One history record per camera; the batch's time is split by data share so lifetime stats don't double-count.
+        let all_bytes: u64 = per.iter().map(|p| p.bytes).sum();
+        for pp in &per {
+            let Some(profile) = self.profile(pp.profile) else { continue };
+            let share = if all_bytes > 0 { pp.bytes as f64 / all_bytes as f64 } else { 1.0 / per.len() as f64 };
+            let dir = run.plan.items.iter().find(|i| i.group == pp.profile).map(|i| i.dest_dir.clone()).unwrap_or_else(|| s.dest_dir.clone());
+            let rec = Record {
+                when: now,
+                profile: profile.name.clone(),
+                dest: dir.display().to_string(),
+                copied: pp.copied,
+                skipped: pp.skipped,
+                failed: pp.failed,
+                bytes: pp.bytes,
+                secs: (s.elapsed.as_secs_f64() * share).round() as u64,
+                cancelled: s.cancelled,
+            };
+            let _ = history::append(&self.paths.history, &rec);
+        }
         if self.cfg.notify && self.sys_actions {
+            let names: Vec<String> = run.profiles.iter().filter_map(|i| self.profile(*i).map(|p| p.name.clone())).collect();
+            let name = if names.len() > 1 { format!("Batch ({})", names.join(" + ")) } else { names.first().cloned().unwrap_or_default() };
             let body = if s.cancelled {
                 format!("{name}: cancelled after {} files", s.copied)
             } else if s.failed > 0 {
@@ -494,7 +593,8 @@ impl App {
             };
             sys::notify("offload", &body);
         }
-        self.summary = Some((run.profile, s));
+        self.per_profile = per;
+        self.summary = Some((run.profiles.clone(), s));
         self.eject_confirm = None;
         self.screen = Screen::Summary;
     }
@@ -502,22 +602,53 @@ impl App {
     // ---------- starting things ----------
 
     pub fn begin_scan(&mut self, idx: usize) {
-        let Some(profile) = self.profile(idx).cloned() else { return };
+        self.begin_scan_many(vec![idx]);
+    }
+
+    /// Start a batch with every camera whose card is plugged in.
+    pub fn begin_batch(&mut self) {
+        self.refresh_live();
+        let connected = self.connected_profiles();
+        if connected.is_empty() {
+            self.toast("No camera cards detected. Plug one in first.", Level::Warn);
+            return;
+        }
+        let missing: Vec<String> = (0..self.cfg.profiles.len()).filter(|i| !connected.contains(i)).map(|i| self.cfg.profiles[i].name.clone()).collect();
+        if !missing.is_empty() {
+            self.toast(format!("Not connected, left out of the batch: {}", missing.join(", ")), Level::Warn);
+        }
+        self.begin_scan_many(connected);
+    }
+
+    pub fn begin_scan_many(&mut self, idxs: Vec<usize>) {
+        let profiles: Vec<(usize, Profile)> = idxs.iter().filter_map(|i| self.profile(*i).map(|p| (*i, p.clone()))).collect();
+        if profiles.is_empty() {
+            return;
+        }
         let (tx, rx) = mpsc::channel();
+        let ids = idxs.clone();
         std::thread::spawn(move || {
-            let r = scan::scan_profile(&profile);
-            let _ = tx.send((idx, r));
+            let parts = profiles.into_iter().map(|(i, p)| (i, scan::scan_profile(&p))).collect();
+            let _ = tx.send((ids, scan::merge_scans(parts)));
         });
-        self.scan_profile = idx;
+        self.scan_profiles = idxs;
         self.scan_rx = Some(rx);
         self.screen = Screen::Scanning;
     }
 
     pub fn start_run(&mut self) {
         let Some(rv) = &mut self.review else { return };
-        let Some(profile) = self.cfg.profiles.get(rv.profile).cloned() else { return };
-        let files: Vec<_> = rv.scan.files.iter().zip(&rv.selected).filter(|(_, s)| **s).map(|(f, _)| f).collect();
-        let plan = match engine::build_plan(&self.cfg, &profile, &files, Local::now()) {
+        let profs: Vec<(usize, Profile)> = rv.profiles.iter().filter_map(|i| self.cfg.profiles.get(*i).map(|p| (*i, p.clone()))).collect();
+        let parts: Vec<engine::BatchPart> = profs
+            .iter()
+            .map(|(i, p)| engine::BatchPart {
+                profile_index: *i,
+                profile: p,
+                files: rv.scan.files.iter().zip(&rv.selected).filter(|(f, sel)| **sel && f.profile == *i).map(|(f, _)| f).collect(),
+            })
+            .filter(|part| !part.files.is_empty())
+            .collect();
+        let plan = match engine::build_batch_plan(&self.cfg, &parts, Local::now()) {
             Ok(p) => p,
             Err(e) => {
                 rv.error = Some(e.to_string());
@@ -539,7 +670,7 @@ impl App {
         let n = plan.items.len();
         let now = Instant::now();
         self.run = Some(Run {
-            profile: rv.profile,
+            profiles: parts.iter().map(|p| p.profile_index).collect(),
             plan,
             state: vec![ItemState::Queued; n],
             copied: 0,
@@ -617,14 +748,25 @@ impl App {
 
     fn home_key(&mut self, key: KeyEvent) {
         let n = self.cfg.profiles.len();
+        let items = self.home_items();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.home_sel = self.home_sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.home_sel + 1 < n {
+                if self.home_sel + 1 < items {
                     self.home_sel += 1
                 }
             }
-            KeyCode::Enter => self.begin_scan(self.home_sel),
+            KeyCode::Enter => {
+                if self.has_batch() && self.home_sel == n {
+                    self.begin_batch();
+                } else {
+                    self.begin_scan(self.home_sel);
+                }
+            }
+            KeyCode::Char('b') | KeyCode::Char('0') if self.has_batch() => {
+                self.home_sel = n;
+                self.begin_batch();
+            }
             KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
                 let i = c as usize - '1' as usize;
                 if i < n {
@@ -782,7 +924,14 @@ impl App {
                 }
             }
             KeyCode::Char('x') | KeyCode::Char('e') => {
-                let vols = self.summary.as_ref().and_then(|(i, _)| self.cfg.profiles.get(*i)).map(|p| sys::volumes_of(&p.source_paths())).unwrap_or_default();
+                let vols = self
+                    .summary
+                    .as_ref()
+                    .map(|(ids, _)| {
+                        let paths: Vec<PathBuf> = ids.iter().filter_map(|i| self.cfg.profiles.get(*i)).flat_map(|p| p.source_paths()).collect();
+                        sys::volumes_of(&paths)
+                    })
+                    .unwrap_or_default();
                 if vols.is_empty() {
                     self.toast("No ejectable source volumes are mounted.", Level::Warn);
                 } else {
@@ -1025,7 +1174,11 @@ impl App {
         match (h, self.screen) {
             (Hit::Profile(i), Screen::Home) => {
                 if self.home_sel == i {
-                    self.begin_scan(i);
+                    if self.has_batch() && i == self.cfg.profiles.len() {
+                        self.begin_batch();
+                    } else {
+                        self.begin_scan(i);
+                    }
                 } else {
                     self.home_sel = i;
                 }
@@ -1065,7 +1218,7 @@ impl App {
     fn scroll_by(&mut self, d: i32) {
         let step = |v: usize, max: usize| -> usize { (v as i64 + d as i64).clamp(0, max as i64) as usize };
         match self.screen {
-            Screen::Home => self.home_sel = step(self.home_sel, self.cfg.profiles.len().saturating_sub(1)),
+            Screen::Home => self.home_sel = step(self.home_sel, self.home_items().saturating_sub(1)),
             Screen::Review => {
                 if let Some(rv) = &mut self.review {
                     match rv.focus {

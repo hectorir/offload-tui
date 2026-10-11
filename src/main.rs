@@ -19,8 +19,12 @@ struct Cli {
 enum Cmd {
     /// Copy a profile without the UI (for scripts)
     Run {
-        /// Profile name (partial names work, e.g. "dji")
-        profile: String,
+        /// Profile name(s); partial names work (e.g. `dji`). Several names copy them together as one batch.
+        #[arg(value_name = "PROFILE")]
+        profiles: Vec<String>,
+        /// Copy every profile as one batch
+        #[arg(short, long)]
+        all: bool,
         /// Don't ask for confirmation
         #[arg(short, long)]
         yes: bool,
@@ -72,10 +76,11 @@ fn real_main() -> Result<()> {
             let cfg = Config::load_or_default(&cfg_path)?;
             tui::run(App::new(cfg, paths))
         }
-        Some(Cmd::Run { profile, yes, dry_run }) => {
+        Some(Cmd::Run { profiles, all, yes, dry_run }) => {
             let cfg = Config::load_or_default(&cfg_path)?;
             let stdin = std::io::stdin();
-            let code = headless::run(&cfg, &profile, yes, dry_run, &paths.history, &mut stdin.lock(), &mut std::io::stdout())?;
+            let code =
+                headless::run(&cfg, &headless::Options { names: &profiles, all, yes, dry_run }, &paths.history, &mut stdin.lock(), &mut std::io::stdout())?;
             std::process::exit(code);
         }
         Some(Cmd::Profiles) => {

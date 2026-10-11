@@ -211,3 +211,69 @@ fn chrono_today() -> String {
     let o = Command::new("date").arg("+%Y-%m-%d").output().unwrap();
     String::from_utf8_lossy(&o.stdout).trim().to_string()
 }
+
+fn two_camera_config(e: &Env) -> PathBuf {
+    let cfg = e.p("two.toml");
+    fs::write(
+        &cfg,
+        format!(
+            "destination = '{}'\n[[profile]]\nname = 'Action Cam'\nsubfolder = 'Action'\nsources = ['{}']\ninclude = ['mp4']\nexclude = ['lrf']\n\n[[profile]]\nname = 'Mirrorless'\nsubfolder = 'Mirror'\nsources = ['{}']\ninclude = ['arw', 'mp4']\n",
+            e.p("backup").display(),
+            e.p("action").display(),
+            e.p("mirror").display()
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(e.p("action")).unwrap();
+    fs::create_dir_all(e.p("mirror")).unwrap();
+    fs::write(e.p("action/A.MP4"), vec![1u8; 60_000]).unwrap();
+    fs::write(e.p("action/A.LRF"), b"x").unwrap();
+    fs::write(e.p("mirror/B.ARW"), vec![2u8; 40_000]).unwrap();
+    fs::write(e.p("mirror/A.MP4"), vec![3u8; 30_000]).unwrap(); // same name as the action cam's file
+    cfg
+}
+
+#[test]
+fn batch_dry_run_lists_both_cameras_and_writes_nothing() {
+    let e = Env::new();
+    let cfg = two_camera_config(&e);
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "action", "mirror", "--dry-run"]).output().unwrap();
+    let s = out(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("Batch: Action Cam + Mirrorless"), "{s}");
+    assert!(s.contains("[Action Cam] A.MP4") && s.contains("[Mirrorless] B.ARW") && s.contains("[Mirrorless] A.MP4"), "{s}");
+    assert!(!s.contains("LRF"));
+    assert!(!e.p("backup").exists());
+}
+
+#[test]
+fn run_all_copies_every_camera_into_its_own_folder() {
+    let e = Env::new();
+    let cfg = two_camera_config(&e);
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "--all", "--yes"]).output().unwrap();
+    let s = out(&o);
+    assert!(o.status.success(), "{s}");
+    assert!(s.contains("3 copied") && s.contains("0 failed"), "{s}");
+    assert!(s.contains("Action Cam") && s.contains("Mirrorless"), "per-camera lines:\n{s}");
+    let day = chrono_today();
+    let root = e.p("backup").join(day);
+    assert_eq!(fs::read(root.join("Action/A.MP4")).unwrap(), vec![1u8; 60_000]);
+    assert_eq!(fs::read(root.join("Mirror/A.MP4")).unwrap(), vec![3u8; 30_000], "same file name, different camera, no clash");
+    assert_eq!(fs::read(root.join("Mirror/B.ARW")).unwrap(), vec![2u8; 40_000]);
+    assert!(!root.join("Action/A.LRF").exists());
+    let hist = fs::read_to_string(e.p("xdg-data/offload/history.jsonl")).unwrap();
+    assert_eq!(hist.lines().count(), 2, "one history record per camera");
+}
+
+#[test]
+fn run_requires_a_profile_or_all() {
+    let e = Env::new();
+    let cfg = two_camera_config(&e);
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "--yes"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(out(&o).contains("at least one profile"), "{}", out(&o));
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "action", "ghost", "--yes"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(out(&o).contains("no profile matching 'ghost'"));
+    assert!(!e.p("backup").exists(), "an unknown name aborts before anything is written");
+}

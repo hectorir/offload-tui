@@ -15,12 +15,15 @@ pub struct FileEntry {
     pub date: NaiveDate,
     /// Lowercased extension.
     pub ext: String,
-    /// Index into the profile's sources.
+    /// Index into `ScanResult::sources`.
     pub source: usize,
+    /// Index of the owning profile in the config (set when scans are merged for a batch).
+    pub profile: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct SourceStatus {
+    pub profile: usize,
     pub path: PathBuf,
     pub present: bool,
     pub files: usize,
@@ -62,10 +65,30 @@ impl ScanResult {
     }
 }
 
+/// Combine per-profile scans into one result for a batch review. Files are grouped by camera (in the
+/// order given), oldest first within each camera, and tagged with their profile index.
+pub fn merge_scans(parts: Vec<(usize, ScanResult)>) -> ScanResult {
+    let mut out = ScanResult::default();
+    for (profile, mut scan) in parts {
+        let offset = out.sources.len();
+        for s in &mut scan.sources {
+            s.profile = profile;
+        }
+        for f in &mut scan.files {
+            f.profile = profile;
+            f.source += offset;
+        }
+        out.ignored += scan.ignored;
+        out.sources.extend(scan.sources);
+        out.files.extend(scan.files);
+    }
+    out
+}
+
 pub fn scan_profile(p: &Profile) -> ScanResult {
     let mut res = ScanResult::default();
     for (i, src) in p.source_paths().into_iter().enumerate() {
-        let mut st = SourceStatus { path: src.clone(), present: src.is_dir(), files: 0, bytes: 0 };
+        let mut st = SourceStatus { profile: 0, path: src.clone(), present: src.is_dir(), files: 0, bytes: 0 };
         if st.present {
             scan_dir(p, &src, i, &mut res, &mut st);
         }
@@ -100,7 +123,7 @@ fn scan_dir(p: &Profile, dir: &Path, source: usize, res: &mut ScanResult, st: &m
         let date = DateTime::<Local>::from(modified).date_naive();
         st.files += 1;
         st.bytes += meta.len();
-        res.files.push(FileEntry { path: ent.path().to_path_buf(), size: meta.len(), modified, date, ext, source });
+        res.files.push(FileEntry { path: ent.path().to_path_buf(), size: meta.len(), modified, date, ext, source, profile: 0 });
     }
 }
 

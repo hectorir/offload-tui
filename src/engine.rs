@@ -28,10 +28,15 @@ pub struct PlanItem {
     pub size: u64,
     pub modified: SystemTime,
     pub name: String,
+    /// Folder this file is written into (`<dest>/<date>/<subfolder>`).
+    pub dest_dir: PathBuf,
+    /// Which camera/profile it belongs to (index into the config's profiles).
+    pub group: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct Plan {
+    /// Single camera: that camera's folder. Batch: the shared dated folder.
     pub dest_dir: PathBuf,
     pub items: Vec<PlanItem>,
 }
@@ -40,33 +45,83 @@ impl Plan {
     pub fn total_bytes(&self) -> u64 {
         self.items.iter().map(|i| i.size).sum()
     }
+
+    /// Distinct destination folders, in first-use order.
+    pub fn dest_dirs(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = vec![];
+        for i in &self.items {
+            if !v.contains(&i.dest_dir) {
+                v.push(i.dest_dir.clone());
+            }
+        }
+        v
+    }
 }
 
-/// Build the plan for a profile: `<dest>/<date>/<subfolder>/`.
-pub fn build_plan(cfg: &Config, profile: &Profile, files: &[&FileEntry], now: chrono::DateTime<chrono::Local>) -> Result<Plan> {
-    profile.validate()?;
+/// One camera's share of a batch.
+pub struct BatchPart<'a> {
+    pub profile_index: usize,
+    pub profile: &'a Profile,
+    pub files: Vec<&'a FileEntry>,
+}
+
+/// `<dest>/<date>/<subfolder>/` for one profile.
+pub fn profile_dest_dir(cfg: &Config, profile: &Profile, date: &str) -> PathBuf {
+    let mut dir = cfg.dest_base_for(profile).join(date);
+    if !profile.subfolder.is_empty() {
+        dir = dir.join(&profile.subfolder);
+    }
+    dir
+}
+
+/// Build one plan covering several cameras. Each camera keeps its own subfolder under the shared dated folder.
+pub fn build_batch_plan(cfg: &Config, parts: &[BatchPart], now: chrono::DateTime<chrono::Local>) -> Result<Plan> {
+    let Some(first) = parts.first() else { bail!("no cameras in the batch") };
     let date = cfg.render_date(now)?;
     crate::config::validate_component(&date)?;
-    let mut dest_dir = cfg.dest_base_for(profile).join(&date);
-    if !profile.subfolder.is_empty() {
-        dest_dir = dest_dir.join(&profile.subfolder);
+    let mut items = vec![];
+    for part in parts {
+        part.profile.validate()?;
+        let dir = profile_dest_dir(cfg, part.profile, &date);
+        for f in &part.files {
+            items.push(PlanItem {
+                source: f.path.clone(),
+                size: f.size,
+                modified: f.modified,
+                name: f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                dest_dir: dir.clone(),
+                group: part.profile_index,
+            });
+        }
     }
-    let items = files
-        .iter()
-        .map(|f| PlanItem {
-            source: f.path.clone(),
-            size: f.size,
-            modified: f.modified,
-            name: f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        })
-        .collect();
+    let dest_dir = if parts.len() == 1 { profile_dest_dir(cfg, first.profile, &date) } else { cfg.dest_base_for(first.profile).join(&date) };
     Ok(Plan { dest_dir, items })
+}
+
+/// Build the plan for a single profile: `<dest>/<date>/<subfolder>/`.
+pub fn build_plan(cfg: &Config, profile: &Profile, files: &[&FileEntry], now: chrono::DateTime<chrono::Local>) -> Result<Plan> {
+    build_batch_plan(cfg, &[BatchPart { profile_index: 0, profile, files: files.to_vec() }], now)
 }
 
 /// Bytes that would actually need writing (files already present with the same size are assumed done;
 /// the checksum decides for real during the copy).
 pub fn bytes_needed(plan: &Plan) -> u64 {
-    plan.items.iter().filter(|i| fs::symlink_metadata(plan.dest_dir.join(&i.name)).map(|m| m.len() != i.size).unwrap_or(true)).map(|i| i.size).sum()
+    plan.items.iter().filter(|i| needs_write(i)).map(|i| i.size).sum()
+}
+
+fn needs_write(i: &PlanItem) -> bool {
+    fs::symlink_metadata(i.dest_dir.join(&i.name)).map(|m| m.len() != i.size).unwrap_or(true)
+}
+
+fn device_of(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = path.to_path_buf();
+    while !p.exists() {
+        if !p.pop() {
+            return 0;
+        }
+    }
+    fs::metadata(&p).map(|m| m.dev()).unwrap_or(0)
 }
 
 /// Checks that must pass before any byte is written.
@@ -74,19 +129,31 @@ pub fn preflight(plan: &Plan) -> std::result::Result<(), String> {
     if plan.items.is_empty() {
         return Err("Nothing selected to copy.".into());
     }
-    if !fsutil::destination_volume_present(&plan.dest_dir) {
-        return Err(format!(
-            "Destination drive is not mounted ({}). Plug it in and try again.",
-            fsutil::volume_root(&plan.dest_dir).map(|p| p.display().to_string()).unwrap_or_default()
-        ));
-    }
-    let needed = bytes_needed(plan);
-    match fsutil::disk_space(&plan.dest_dir) {
-        Some((_, free)) if free < needed.saturating_add(1 << 20) => {
-            Err(format!("Not enough space on the destination: need {}, only {} free.", fsutil::human_bytes(needed), fsutil::human_bytes(free)))
+    for dir in plan.dest_dirs() {
+        if !fsutil::destination_volume_present(&dir) {
+            return Err(format!(
+                "Destination drive is not mounted ({}). Plug it in and try again.",
+                fsutil::volume_root(&dir).map(|p| p.display().to_string()).unwrap_or_default()
+            ));
         }
-        _ => Ok(()),
     }
+    // Space is checked per physical filesystem, since cameras may be sent to different drives.
+    let mut per_device: Vec<(u64, PathBuf, u64)> = vec![];
+    for i in plan.items.iter().filter(|i| needs_write(i)) {
+        let dev = device_of(&i.dest_dir);
+        match per_device.iter_mut().find(|(d, _, _)| *d == dev) {
+            Some(e) => e.2 += i.size,
+            None => per_device.push((dev, i.dest_dir.clone(), i.size)),
+        }
+    }
+    for (_, dir, needed) in per_device {
+        if let Some((_, free)) = fsutil::disk_space(&dir)
+            && free < needed.saturating_add(1 << 20)
+        {
+            return Err(format!("Not enough space on the destination: need {}, only {} free.", fsutil::human_bytes(needed), fsutil::human_bytes(free)));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,12 +285,12 @@ fn resolve_dest(dest_dir: &Path, item: &PlanItem, reserved: &mut HashSet<String>
     let mut src_hash: Option<blake3::Hash> = None;
     for n in 0..10_000u32 {
         let cand = candidate_name(&item.name, n);
+        let path = dest_dir.join(&cand);
         // macOS volumes are usually case-insensitive; treat names case-insensitively to be safe.
-        let key = cand.to_lowercase();
+        let key = path.to_string_lossy().to_lowercase();
         if reserved.contains(&key) {
             continue;
         }
-        let path = dest_dir.join(&cand);
         match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 reserved.insert(key);
@@ -374,11 +441,12 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
     let start = Instant::now();
     let tally = Arc::new(Mutex::new(Tally { summary: Summary { dest_dir: plan.dest_dir.clone(), ..Default::default() }, tx: tx.clone() }));
 
-    if let Err(e) = prepare_dest_dir(&plan.dest_dir) {
-        for (i, item) in plan.items.iter().enumerate() {
-            Tally::done(&tally, i, &item.name, item.size, Outcome::Failed(format!("cannot create destination: {e}")));
+    // Create every destination folder up front; a folder that can't be made fails only its own files.
+    let mut bad_dirs: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    for dir in plan.dest_dirs() {
+        if let Err(e) = prepare_dest_dir(&dir) {
+            bad_dirs.insert(dir, e.to_string());
         }
-        return finish(tally, start, &tx, &plan.dest_dir);
     }
 
     let (vtx, vrx): (_, Receiver<VerifyJob>) = sync_channel(8);
@@ -415,7 +483,11 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
                 continue;
             }
             let _ = tx.send(Event::Started { index });
-            let (final_path, renamed) = match resolve_dest(&plan.dest_dir, item, &mut reserved) {
+            if let Some(e) = bad_dirs.get(&item.dest_dir) {
+                Tally::done(&tally, index, &item.name, item.size, Outcome::Failed(format!("cannot create destination: {e}")));
+                continue;
+            }
+            let (final_path, renamed) = match resolve_dest(&item.dest_dir, item, &mut reserved) {
                 Ok(Resolved::Skip(dest)) => {
                     let _ = tx.send(Event::Progress { index, bytes: item.size });
                     let _ = tx.send(Event::VerifyProgress { index, bytes: item.size });
@@ -456,8 +528,10 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
     });
 
     // Persist the directory entries of the finalized files.
-    if let Ok(d) = File::open(&plan.dest_dir) {
-        let _ = fsutil::flush_best_effort(&d);
+    for dir in plan.dest_dirs() {
+        if let Ok(d) = File::open(&dir) {
+            let _ = fsutil::flush_best_effort(&d);
+        }
     }
     finish(tally, start, &tx, &plan.dest_dir)
 }
