@@ -3,6 +3,10 @@ date_format = "%Y-%m-%d"
 theme = "catppuccin"
 notify = true
 mode = "copy"
+organize = "run"
+keep_awake = true
+when_done = "nothing"
+mirror = ""
 
 [[profile]]
 name = "DJI Osmo Action"

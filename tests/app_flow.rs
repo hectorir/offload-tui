@@ -258,8 +258,8 @@ fn settings_editor_edits_saves_and_validates() {
     assert_eq!(r.app.cfg.destination, "/tmp/new-backup");
     assert_eq!(Config::load(&r.paths.config).unwrap().destination, "/tmp/new-backup", "saved to disk");
 
-    // go to DJI profile's Subfolder: rows = 5 globals, header, name, subfolder
-    r.app.editor.cursor = 7;
+    // go to DJI profile's Subfolder: rows = 9 globals, header, name, subfolder
+    r.app.editor.cursor = 11;
     key(&mut r.app, KeyCode::Enter);
     r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     typ(&mut r.app, "../../evil");
@@ -271,7 +271,7 @@ fn settings_editor_edits_saves_and_validates() {
     assert!(r.app.editor.input.is_none());
 
     // edit include list
-    r.app.editor.cursor = 9;
+    r.app.editor.cursor = 13;
     key(&mut r.app, KeyCode::Enter);
     r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     typ(&mut r.app, "MP4, .mov wav");
@@ -288,7 +288,7 @@ fn settings_editor_edits_saves_and_validates() {
     assert_eq!(r.app.cfg.profiles.len(), n);
 
     // toggle notify
-    r.app.editor.cursor = 2;
+    r.app.editor.cursor = r.app.editor_rows().iter().position(|row| *row == Row::Global(GField::Notify)).unwrap();
     key(&mut r.app, KeyCode::Enter);
     assert!(!Config::load(&r.paths.config).unwrap().notify);
 
@@ -301,7 +301,7 @@ fn cannot_delete_last_profile() {
     let mut r = rig();
     r.app.cfg.profiles.truncate(1);
     chr(&mut r.app, 'e');
-    r.app.editor.cursor = 5;
+    r.app.editor.cursor = r.app.editor_rows().iter().position(|row| matches!(row, Row::Header(0))).unwrap();
     chr(&mut r.app, 'd');
     assert!(r.app.editor.confirm_delete.is_none());
     assert_eq!(r.app.cfg.profiles.len(), 1);
@@ -833,4 +833,219 @@ fn dump_modes() {
     println!("=====DELETE_CONFIRM\n{}", render(&mut r.app, 140, 26));
     chr(&mut r.app, 'y');
     println!("=====AFTER_DELETE\n{}", render(&mut r.app, 120, 26));
+}
+
+// ---------- shoot-date folders, second drive, keep-awake / sleep-when-done ----------
+
+fn mirror_dir(r: &Rig) -> PathBuf {
+    r.dest.parent().unwrap().join("second-drive")
+}
+
+fn finish_run(r: &mut Rig) {
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+}
+
+#[test]
+fn o_switches_to_shoot_date_folders_and_files_land_by_day_filmed() {
+    let mut r = mode_rig();
+    let old = std::time::SystemTime::now() - Duration::from_secs(40 * 86_400);
+    fs::File::options().write(true).open(r.src.join("A.MP4")).unwrap().set_modified(old).unwrap();
+    to_review(&mut r);
+    assert!(!r.app.review.as_ref().unwrap().shoot_dates, "default is today's date");
+    assert!(render(&mut r.app, 140, 44).contains("by today's date"));
+    chr(&mut r.app, 'o');
+    assert!(r.app.review.as_ref().unwrap().shoot_dates);
+    let s = render(&mut r.app, 140, 44);
+    assert!(s.contains("by SHOOT date") && s.contains("per day filmed") && s.contains("day shot"), "{s}");
+    finish_run(&mut r);
+    let d = chrono::DateTime::<chrono::Local>::from(old).format("%Y-%m-%d").to_string();
+    assert!(r.dest.join(&d).join("DJI/A.MP4").exists(), "old clip filed under the day it was shot");
+    assert!(day_dir(&r).join("B.MP4").exists(), "today's clips under today");
+    assert!(r.app.cfg.organize == "run", "the toggle is for this run only; saved settings are untouched");
+}
+
+#[test]
+fn config_default_organize_shoot_is_honoured_and_toggles_back() {
+    let mut r = mode_rig();
+    r.app.cfg.organize = "shoot".into();
+    to_review(&mut r);
+    assert!(r.app.review.as_ref().unwrap().shoot_dates);
+    chr(&mut r.app, 'o');
+    assert!(!r.app.review.as_ref().unwrap().shoot_dates);
+}
+
+#[test]
+fn r_without_a_mirror_explains_how_to_set_one() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    chr(&mut r.app, 'r');
+    let rv = r.app.review.as_ref().unwrap();
+    assert!(!rv.mirror && rv.error.as_deref().unwrap().contains("mirror folder"));
+}
+
+#[test]
+fn mirror_runs_by_default_when_configured_and_r_turns_it_off() {
+    let mut r = mode_rig();
+    r.app.cfg.mirror = mirror_dir(&r).to_string_lossy().into();
+    to_review(&mut r);
+    assert!(r.app.review.as_ref().unwrap().mirror);
+    let s = render(&mut r.app, 140, 44);
+    assert!(s.contains("mirror") && s.contains("second-drive"), "{s}");
+    chr(&mut r.app, 'r');
+    assert!(!r.app.review.as_ref().unwrap().mirror);
+    assert!(render(&mut r.app, 140, 44).contains("off for this run"));
+    finish_run(&mut r);
+    assert!(!mirror_dir(&r).exists(), "mirror off: nothing written there");
+}
+
+#[test]
+fn mirrored_run_summary_and_delete_offer_require_the_second_copy() {
+    let mut r = mode_rig();
+    r.app.cfg.mirror = mirror_dir(&r).to_string_lossy().into();
+    to_review(&mut r);
+    finish_run(&mut r);
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    for f in ["A.MP4", "B.MP4", "C.WAV"] {
+        assert_eq!(fs::read(mirror_dir(&r).join(&day).join("DJI").join(f)).unwrap(), fs::read(r.src.join(f)).unwrap());
+    }
+    let s = render(&mut r.app, 140, 44);
+    assert!(s.contains("3 files verified on the second drive"), "{s}");
+    assert_eq!(r.app.originals.len(), 3);
+    assert!(r.app.originals.iter().all(|o| o.mirror.is_some()));
+    // Remove one second-drive copy: deleting must keep that original.
+    fs::remove_file(mirror_dir(&r).join(&day).join("DJI/B.MP4")).unwrap();
+    chr(&mut r.app, 'd');
+    chr(&mut r.app, 'y');
+    assert!(r.src.join("B.MP4").exists(), "its mirror copy vanished, so the original stays");
+    assert!(!r.src.join("A.MP4").exists() && !r.src.join("C.WAV").exists());
+}
+
+#[test]
+fn unmounted_mirror_blocks_the_run_until_it_is_switched_off() {
+    let mut r = mode_rig();
+    r.app.cfg.mirror = "/Volumes/definitely-not-mounted-zz/backup".into();
+    to_review(&mut r);
+    assert!(render(&mut r.app, 140, 44).contains("mirror) drive not mounted"));
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Review);
+    assert!(r.app.review.as_ref().unwrap().error.as_deref().unwrap().contains("mirror"));
+    chr(&mut r.app, 'r');
+    finish_run(&mut r);
+    assert_eq!(r.app.summary.as_ref().unwrap().1.copied, 3);
+}
+
+#[test]
+fn settings_rows_toggle_the_new_options() {
+    let mut r = mode_rig();
+    chr(&mut r.app, 'e');
+    let at = |r: &Rig, f: GField| r.app.editor_rows().iter().position(|row| *row == Row::Global(f)).unwrap();
+    let saved = |r: &Rig| Config::load(&r.paths.config).unwrap();
+    r.app.editor.cursor = at(&r, GField::Organize);
+    key(&mut r.app, KeyCode::Enter);
+    assert!(saved(&r).organize_by_shoot_date());
+    assert!(render(&mut r.app, 130, 44).contains("shoot date (a folder per day filmed)"));
+    r.app.editor.cursor = at(&r, GField::KeepAwake);
+    key(&mut r.app, KeyCode::Enter);
+    assert!(!saved(&r).keep_awake);
+    r.app.editor.cursor = at(&r, GField::WhenDone);
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(saved(&r).when_done, "sleep");
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(saved(&r).when_done, "shutdown");
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(saved(&r).when_done, "nothing");
+    // mirror is a text field
+    r.app.editor.cursor = at(&r, GField::Mirror);
+    key(&mut r.app, KeyCode::Enter);
+    typ(&mut r.app, "/Volumes/Second/Backup");
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(saved(&r).mirror, "/Volumes/Second/Backup");
+    // the same folder as the destination is refused
+    key(&mut r.app, KeyCode::Enter);
+    r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    let dest = r.app.cfg.destination.clone();
+    typ(&mut r.app, &dest);
+    key(&mut r.app, KeyCode::Enter);
+    assert!(r.app.editor.input.is_some(), "invalid input keeps the editor open");
+    assert_eq!(saved(&r).mirror, "/Volumes/Second/Backup");
+}
+
+#[test]
+fn sleep_when_done_counts_down_and_any_key_cancels_it() {
+    let mut r = mode_rig();
+    r.app.cfg.when_done = "sleep".into();
+    to_review(&mut r);
+    finish_run(&mut r);
+    assert!(r.app.power_at.is_some(), "a clean run schedules the sleep");
+    let s = render(&mut r.app, 140, 44);
+    assert!(s.contains("will go to sleep in") && s.contains("press any key to cancel"), "{s}");
+    chr(&mut r.app, 'x'); // swallowed: must not start an eject
+    assert!(r.app.power_at.is_none());
+    assert!(r.app.eject_confirm.is_none());
+}
+
+#[test]
+fn no_sleep_when_anything_went_wrong() {
+    let mut r = mode_rig();
+    r.app.cfg.when_done = "shutdown".into();
+    // A file where the mirror folder should be: the main copy succeeds, the mirror cannot.
+    let blocker = r._tmp.path().join("blocker");
+    fs::write(&blocker, b"x").unwrap();
+    r.app.cfg.mirror = blocker.to_string_lossy().into();
+    to_review(&mut r);
+    finish_run(&mut r);
+    let s = &r.app.summary.as_ref().unwrap().1;
+    assert_eq!((s.copied, s.mirror_failures.len()), (3, 3));
+    assert!(r.app.power_at.is_none(), "never shut down while a copy is missing from the second drive");
+    assert!(r.app.originals.is_empty(), "and nothing is offered for deletion");
+    assert!(render(&mut r.app, 140, 44).contains("FAILED"));
+}
+
+#[test]
+fn nothing_is_scheduled_by_default() {
+    let mut r = mode_rig();
+    to_review(&mut r);
+    finish_run(&mut r);
+    assert!(r.app.power_at.is_none() && r.app.awake.is_none());
+}
+
+/// Renders the folder / mirror / sleep screens as text. Run: cargo test --test app_flow dump_options -- --ignored --nocapture
+#[test]
+#[ignore]
+fn dump_options() {
+    let demo = PathBuf::from("/tmp/offload-demo2");
+    let _ = fs::remove_dir_all(&demo);
+    let dji = demo.join("SD_Card/DCIM/DJI_001");
+    for d in [&dji, &demo.join("Backup"), &demo.join("Second SSD")] {
+        fs::create_dir_all(d).unwrap();
+    }
+    for (i, (day, mb)) in [(4u64, 120usize), (4, 95), (2, 140), (2, 60), (0, 80)].iter().enumerate() {
+        let f = dji.join(format!("DJI_2026101{}_{:04}_D.MP4", i, i + 1));
+        fs::write(&f, vec![i as u8; mb * 10_000]).unwrap();
+        let t = std::time::SystemTime::now() - Duration::from_secs(day * 86_400);
+        fs::File::options().write(true).open(&f).unwrap().set_modified(t).unwrap();
+    }
+    let mut cfg = Config::default();
+    cfg.destination = demo.join("Backup").to_string_lossy().into();
+    cfg.mirror = demo.join("Second SSD").to_string_lossy().into();
+    cfg.when_done = "sleep".into();
+    cfg.profiles.truncate(1);
+    cfg.profiles[0].sources = vec![dji.to_string_lossy().into()];
+    let paths = Paths { config: demo.join("cfg/config.toml"), history: demo.join("data/history.jsonl"), state: demo.join("data/state.json") };
+    let mut app = App::new(cfg, paths);
+    app.sys_actions = false;
+    let r = &mut app;
+    key(r, KeyCode::Enter);
+    wait_for(r, Screen::Review);
+    chr(r, 'o');
+    println!("=====OPTIONS_REVIEW\n{}", render(r, 118, 22));
+    key(r, KeyCode::Enter);
+    wait_for(r, Screen::Summary);
+    println!("=====OPTIONS_SUMMARY\n{}", render(r, 100, 21));
+    r.power_at = None; // (skip the "won't sleep after all" toast in the screenshot)
+    key(r, KeyCode::Enter);
+    chr(r, 'e');
+    r.editor.cursor = 4;
+    println!("=====OPTIONS_SETTINGS\n{}", render(r, 100, 17));
 }

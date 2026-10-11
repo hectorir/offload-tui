@@ -60,6 +60,8 @@ pub struct PlanItem {
     pub dest_dir: PathBuf,
     /// Which camera/profile it belongs to (index into the config's profiles).
     pub group: usize,
+    /// Second-drive folder this file is also written into, when mirroring.
+    pub mirror_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +87,21 @@ impl Plan {
         }
         v
     }
+
+    /// Distinct second-drive folders, in first-use order.
+    pub fn mirror_dirs(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = vec![];
+        for d in self.items.iter().filter_map(|i| i.mirror_dir.as_ref()) {
+            if !v.contains(d) {
+                v.push(d.clone());
+            }
+        }
+        v
+    }
+
+    pub fn is_mirrored(&self) -> bool {
+        self.items.iter().any(|i| i.mirror_dir.is_some())
+    }
 }
 
 /// One camera's share of a batch.
@@ -96,34 +113,66 @@ pub struct BatchPart<'a> {
 
 /// `<dest>/<date>/<subfolder>/` for one profile.
 pub fn profile_dest_dir(cfg: &Config, profile: &Profile, date: &str) -> PathBuf {
-    let mut dir = cfg.dest_base_for(profile).join(date);
+    dated_dir(cfg.dest_base_for(profile), profile, date)
+}
+
+fn dated_dir(base: PathBuf, profile: &Profile, date: &str) -> PathBuf {
+    let mut dir = base.join(date);
     if !profile.subfolder.is_empty() {
         dir = dir.join(&profile.subfolder);
     }
     dir
 }
 
-/// Build one plan covering several cameras. Each camera keeps its own subfolder under the shared dated folder.
+/// The dated folder name for one file: the day of the offload, or (when organizing by shoot date) the day it was recorded.
+pub fn date_folder(cfg: &Config, run_date: &str, shot: chrono::NaiveDate) -> Result<String> {
+    if !cfg.organize_by_shoot_date() {
+        return Ok(run_date.to_string());
+    }
+    let d = cfg.render_naive_date(shot)?;
+    crate::config::validate_component(&d)?;
+    if d.is_empty() {
+        bail!("date_format renders an empty name");
+    }
+    Ok(d)
+}
+
+/// Where a file lands on the main drive.
+pub fn file_dest_dir(cfg: &Config, profile: &Profile, run_date: &str, shot: chrono::NaiveDate) -> Result<PathBuf> {
+    Ok(profile_dest_dir(cfg, profile, &date_folder(cfg, run_date, shot)?))
+}
+
+/// Build one plan covering several cameras. Each camera keeps its own subfolder under the dated folder.
+/// Honors `cfg.organize` (per-shoot-day folders) and `cfg.mirror` (a second drive written in the same pass).
 pub fn build_batch_plan(cfg: &Config, parts: &[BatchPart], now: chrono::DateTime<chrono::Local>) -> Result<Plan> {
     let Some(first) = parts.first() else { bail!("no cameras in the batch") };
-    let date = cfg.render_date(now)?;
-    crate::config::validate_component(&date)?;
+    let run_date = cfg.render_date(now)?;
+    crate::config::validate_component(&run_date)?;
+    let mirror = cfg.mirror_base();
     let mut items = vec![];
     for part in parts {
         part.profile.validate()?;
-        let dir = profile_dest_dir(cfg, part.profile, &date);
         for f in &part.files {
+            let date = date_folder(cfg, &run_date, f.date)?;
             items.push(PlanItem {
                 source: f.path.clone(),
                 size: f.size,
                 modified: f.modified,
                 name: f.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                dest_dir: dir.clone(),
+                dest_dir: dated_dir(cfg.dest_base_for(part.profile), part.profile, &date),
                 group: part.profile_index,
+                mirror_dir: mirror.clone().map(|m| dated_dir(m, part.profile, &date)),
             });
         }
     }
-    let dest_dir = if parts.len() == 1 { profile_dest_dir(cfg, first.profile, &date) } else { cfg.dest_base_for(first.profile).join(&date) };
+    // What the UI shows as "the" destination: the dated folder, or the base folder when files fan out by shoot day.
+    let dest_dir = if cfg.organize_by_shoot_date() {
+        cfg.dest_base_for(first.profile)
+    } else if parts.len() == 1 {
+        profile_dest_dir(cfg, first.profile, &run_date)
+    } else {
+        cfg.dest_base_for(first.profile).join(&run_date)
+    };
     Ok(Plan { dest_dir, items, mode: Mode::Copy })
 }
 
@@ -140,6 +189,10 @@ pub fn bytes_needed(plan: &Plan) -> u64 {
 
 fn needs_write(i: &PlanItem) -> bool {
     fs::symlink_metadata(i.dest_dir.join(&i.name)).map(|m| m.len() != i.size).unwrap_or(true)
+}
+
+fn mirror_needs_write(i: &PlanItem, dir: &Path) -> bool {
+    fs::symlink_metadata(dir.join(&i.name)).map(|m| m.len() != i.size).unwrap_or(true)
 }
 
 fn device_of(path: &Path) -> u64 {
@@ -166,13 +219,31 @@ pub fn preflight(plan: &Plan) -> std::result::Result<(), String> {
             ));
         }
     }
-    // Space is checked per physical filesystem, since cameras may be sent to different drives.
+    for dir in plan.mirror_dirs() {
+        if !fsutil::destination_volume_present(&dir) {
+            return Err(format!(
+                "The second (mirror) drive is not mounted ({}). Plug it in, or turn mirroring off.",
+                fsutil::volume_root(&dir).map(|p| p.display().to_string()).unwrap_or_default()
+            ));
+        }
+    }
+    // Space is checked per physical filesystem, since cameras (and the mirror) may be on different drives.
     let mut per_device: Vec<(u64, PathBuf, u64)> = vec![];
-    for i in plan.items.iter().filter(|i| needs_write(i)) {
-        let dev = device_of(&i.dest_dir);
+    let mut add = |dir: &Path, size: u64| {
+        let dev = device_of(dir);
         match per_device.iter_mut().find(|(d, _, _)| *d == dev) {
-            Some(e) => e.2 += i.size,
-            None => per_device.push((dev, i.dest_dir.clone(), i.size)),
+            Some(e) => e.2 += size,
+            None => per_device.push((dev, dir.to_path_buf(), size)),
+        }
+    };
+    for i in &plan.items {
+        if needs_write(i) {
+            add(&i.dest_dir, i.size);
+        }
+        if let Some(m) = &i.mirror_dir
+            && mirror_needs_write(i, m)
+        {
+            add(m, i.size);
         }
     }
     for (_, dir, needed) in per_device {
@@ -183,6 +254,15 @@ pub fn preflight(plan: &Plan) -> std::result::Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// How the second-drive copy of a file turned out (only relevant when mirroring).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mirror {
+    Off,
+    /// Written and checksum-verified there (or an identical file was already there).
+    Ok(PathBuf),
+    Failed(String),
 }
 
 /// What happened to the original on the card (only relevant in move mode).
@@ -201,11 +281,13 @@ pub enum Outcome {
         dest: PathBuf,
         renamed: bool,
         removed: Removal,
+        mirror: Mirror,
     },
     /// Identical file (same checksum) already at the destination.
     Skipped {
         dest: PathBuf,
         removed: Removal,
+        mirror: Mirror,
     },
     Failed(String),
     Cancelled,
@@ -233,6 +315,9 @@ pub struct Summary {
     /// Move mode: originals deleted from the card, and ones that could not be.
     pub moved: usize,
     pub move_failures: Vec<(String, String)>,
+    /// Mirroring: files verified on the second drive, and ones that could not be.
+    pub mirrored: usize,
+    pub mirror_failures: Vec<(String, String)>,
     pub cancelled: bool,
     pub elapsed: Duration,
 }
@@ -282,10 +367,19 @@ impl Tally {
         }
     }
 
+    fn count_mirror(&mut self, name: &str, mirror: &Mirror) {
+        match mirror {
+            Mirror::Ok(_) => self.summary.mirrored += 1,
+            Mirror::Failed(why) => self.summary.mirror_failures.push((name.to_string(), why.clone())),
+            Mirror::Off => {}
+        }
+    }
+
     fn done(tally: &Mutex<Tally>, index: usize, name: &str, size: u64, outcome: Outcome) {
         let mut t = tally.lock().unwrap_or_else(|e| e.into_inner());
         match &outcome {
-            Outcome::Copied { renamed, removed, .. } => {
+            Outcome::Copied { renamed, removed, mirror, .. } => {
+                t.count_mirror(name, mirror);
                 t.summary.copied += 1;
                 t.summary.bytes_copied += size;
                 if *renamed {
@@ -293,7 +387,8 @@ impl Tally {
                 }
                 t.count_removal(name, removed);
             }
-            Outcome::Skipped { removed, .. } => {
+            Outcome::Skipped { removed, mirror, .. } => {
+                t.count_mirror(name, mirror);
                 t.summary.skipped += 1;
                 t.count_removal(name, removed);
             }
@@ -307,14 +402,33 @@ impl Tally {
     }
 }
 
+/// One destination of a file (the main drive, or the mirror) as it moves through the pipeline.
+enum Slot {
+    /// Not requested (no mirror).
+    Off,
+    /// An identical file is already there.
+    Skip(PathBuf),
+    /// Being written to `part`; becomes `final_path` once verified.
+    Write {
+        part: PathBuf,
+        final_path: PathBuf,
+        renamed: bool,
+    },
+    /// Verified and in place.
+    Done {
+        path: PathBuf,
+        renamed: bool,
+    },
+    Failed(String),
+}
+
 struct VerifyJob {
     index: usize,
-    part: PathBuf,
-    final_path: PathBuf,
+    primary: Slot,
+    mirror: Slot,
     expected: blake3::Hash,
     written: u64,
     modified: SystemTime,
-    renamed: bool,
     name: String,
     size: u64,
     source: PathBuf,
@@ -326,13 +440,18 @@ enum Resolved {
 }
 
 /// Delete one original from the card, but only if everything checks out:
-/// the verified copy is still at `dest` with the right size, and the original is a plain file that has not
-/// changed since it was scanned. On any doubt the original is left alone.
-pub fn remove_original(source: &Path, size: u64, modified: SystemTime, dest: &Path) -> std::result::Result<(), String> {
-    match fs::symlink_metadata(dest) {
-        Ok(m) if m.is_file() && m.len() == size => {}
-        Ok(_) => return Err("the copy on the destination has a different size; original kept".into()),
-        Err(_) => return Err("the copy is no longer on the destination; original kept".into()),
+/// every verified copy (main drive, and the mirror if there is one) is still in place with the right size,
+/// and the original is a plain file that has not changed since it was scanned. On any doubt the original is left alone.
+pub fn remove_original(source: &Path, size: u64, modified: SystemTime, dests: &[&Path]) -> std::result::Result<(), String> {
+    if dests.is_empty() {
+        return Err("no verified copy to rely on; original kept".into());
+    }
+    for dest in dests {
+        match fs::symlink_metadata(dest) {
+            Ok(m) if m.is_file() && m.len() == size => {}
+            Ok(_) => return Err("a copy on the destination has a different size; original kept".into()),
+            Err(_) => return Err("a copy is no longer on the destination; original kept".into()),
+        }
     }
     match fs::symlink_metadata(source) {
         Ok(m) if m.is_file() && m.len() == size && m.modified().ok() == Some(modified) => {}
@@ -350,6 +469,8 @@ pub struct Original {
     pub size: u64,
     pub modified: SystemTime,
     pub dest: PathBuf,
+    /// The verified second-drive copy, when mirroring.
+    pub mirror: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -363,7 +484,11 @@ pub struct DeleteReport {
 pub fn delete_originals(list: &[Original]) -> DeleteReport {
     let mut rep = DeleteReport::default();
     for o in list {
-        match remove_original(&o.source, o.size, o.modified, &o.dest) {
+        let mut dests: Vec<&Path> = vec![&o.dest];
+        if let Some(m) = &o.mirror {
+            dests.push(m);
+        }
+        match remove_original(&o.source, o.size, o.modified, &dests) {
             Ok(()) => {
                 rep.deleted += 1;
                 rep.bytes += o.size;
@@ -432,6 +557,33 @@ fn removal(r: std::result::Result<(), String>) -> Removal {
     }
 }
 
+/// Turn the final state of both destinations into the file's outcome, deleting the original in move mode
+/// only when every requested copy is verified.
+fn outcome_for(primary: Slot, mirror: Slot, mode: Mode, source: &Path, size: u64, modified: SystemTime) -> Outcome {
+    let mirror = match mirror {
+        Slot::Off => Mirror::Off,
+        Slot::Skip(p) | Slot::Done { path: p, .. } => Mirror::Ok(p),
+        Slot::Failed(e) => Mirror::Failed(e),
+        Slot::Write { .. } => Mirror::Failed("second-drive copy was never verified".into()),
+    };
+    let (dest, renamed, skipped) = match primary {
+        Slot::Skip(p) => (p, false, true),
+        Slot::Done { path, renamed } => (path, renamed, false),
+        Slot::Failed(e) => return Outcome::Failed(e),
+        Slot::Off | Slot::Write { .. } => return Outcome::Failed("copy was never verified".into()),
+    };
+    let removed = if mode == Mode::Move {
+        match &mirror {
+            Mirror::Failed(_) => Removal::Failed("the second-drive copy failed; original kept".into()),
+            Mirror::Ok(m) => removal(remove_original(source, size, modified, &[&dest, m])),
+            Mirror::Off => removal(remove_original(source, size, modified, &[&dest])),
+        }
+    } else {
+        Removal::NotRequested
+    };
+    if skipped { Outcome::Skipped { dest, removed, mirror } } else { Outcome::Copied { dest, renamed, removed, mirror } }
+}
+
 fn part_path(final_path: &Path) -> PathBuf {
     let name = final_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     final_path.with_file_name(format!(".{name}.part"))
@@ -439,29 +591,54 @@ fn part_path(final_path: &Path) -> PathBuf {
 
 enum CopyErr {
     Cancelled,
+    /// The source could not be read (every destination fails).
     Io(String),
+    /// Every destination failed to write (one message per destination, in order).
+    Dests(Vec<String>),
 }
 
-/// Stream `src` into a fresh `part` file, hashing the source bytes as they are read.
-/// Returns (hash, bytes written).
-fn copy_stream(src: &Path, part: &Path, ctrl: &Control, mut on_bytes: impl FnMut(u64)) -> std::result::Result<(blake3::Hash, u64), CopyErr> {
-    let io = |what: &str, e: io::Error| CopyErr::Io(format!("{what}: {e}"));
-    let mut input = File::open(src).map_err(|e| io("open source", e))?;
-    if !input.metadata().map_err(|e| io("stat source", e))?.is_file() {
+/// Stream `src` into fresh `.part` files (one per destination), hashing the source bytes as they are read,
+/// so a file read once from the card can land on two drives. A destination that fails is dropped on its own;
+/// the others carry on. Returns (hash, bytes written, per-destination error).
+fn copy_stream(
+    src: &Path,
+    parts: &[&Path],
+    ctrl: &Control,
+    mut on_bytes: impl FnMut(u64),
+) -> std::result::Result<(blake3::Hash, u64, Vec<Option<String>>), CopyErr> {
+    let io = |what: &str, e: io::Error| format!("{what}: {e}");
+    let mut input = File::open(src).map_err(|e| CopyErr::Io(io("open source", e)))?;
+    if !input.metadata().map_err(|e| CopyErr::Io(io("stat source", e)))?.is_file() {
         return Err(CopyErr::Io("source is not a regular file".into()));
     }
-    // A stale .part from an interrupted run is removed (never followed if it is a symlink).
-    match fs::remove_file(part) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io("remove stale .part", e)),
+    let mut errs: Vec<Option<String>> = vec![None; parts.len()];
+    let mut outs: Vec<Option<File>> = vec![];
+    for (i, part) in parts.iter().enumerate() {
+        let opened = (|| -> std::result::Result<File, String> {
+            // A stale .part from an interrupted run is removed (never followed if it is a symlink).
+            match fs::remove_file(part) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(io("remove stale .part", e)),
+            }
+            OpenOptions::new()
+                .write(true)
+                .create_new(true) // O_EXCL: never write through a pre-existing file or symlink
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(part)
+                .map_err(|e| io("create destination", e))
+        })();
+        match opened {
+            Ok(f) => outs.push(Some(f)),
+            Err(e) => {
+                errs[i] = Some(e);
+                outs.push(None);
+            }
+        }
     }
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create_new(true) // O_EXCL: never write through a pre-existing file or symlink
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(part)
-        .map_err(|e| io("create destination", e))?;
+    if outs.iter().all(Option::is_none) {
+        return Err(CopyErr::Dests(errs.into_iter().map(|e| e.unwrap_or_default()).collect()));
+    }
 
     let mut written = 0u64;
     let result: std::result::Result<blake3::Hash, CopyErr> = std::thread::scope(|s| {
@@ -497,8 +674,15 @@ fn copy_stream(src: &Path, part: &Path, ctrl: &Control, mut on_bytes: impl FnMut
                 failure = Some(CopyErr::Cancelled);
                 break;
             }
-            if let Err(e) = out.write_all(&buf) {
-                failure = Some(io("write", e));
+            for (i, slot) in outs.iter_mut().enumerate() {
+                if let Some(f) = slot
+                    && let Err(e) = f.write_all(&buf)
+                {
+                    errs[i] = Some(io("write", e));
+                    *slot = None;
+                }
+            }
+            if outs.iter().all(Option::is_none) {
                 break;
             }
             written += buf.len() as u64;
@@ -509,43 +693,73 @@ fn copy_stream(src: &Path, part: &Path, ctrl: &Control, mut on_bytes: impl FnMut
         if let Some(f) = failure {
             return Err(f);
         }
+        if outs.iter().all(Option::is_none) {
+            return Err(CopyErr::Dests(errs.iter().map(|e| e.clone().unwrap_or_default()).collect()));
+        }
         match read {
             Ok(Ok(h)) => Ok(h),
-            Ok(Err(e)) => Err(io("read source", e)),
+            Ok(Err(e)) => Err(CopyErr::Io(io("read source", e))),
             Err(_) => Err(CopyErr::Io("reader thread panicked".into())),
         }
     });
+    drop(outs);
     match result {
-        Ok(h) => Ok((h, written)),
+        Ok(h) => {
+            // A destination that failed midway leaves a partial file; remove it.
+            for (part, e) in parts.iter().zip(&errs) {
+                if e.is_some() {
+                    let _ = fs::remove_file(part);
+                }
+            }
+            Ok((h, written, errs))
+        }
         Err(e) => {
-            drop(out);
-            let _ = fs::remove_file(part);
+            for part in parts {
+                let _ = fs::remove_file(part);
+            }
             Err(e)
         }
     }
 }
 
-fn verify_job(job: &VerifyJob, ctrl: &Control, tx: &Sender<Event>) -> std::result::Result<(), String> {
-    // Flush to the physical disk, then re-read bypassing the cache.
-    File::open(&job.part).and_then(|f| fsutil::flush_best_effort(&f)).map_err(|e| format!("flush: {e}"))?;
-    let index = job.index;
-    let (got, len) = fsutil::hash_file(&job.part, true, |b| {
-        let _ = tx.send(Event::VerifyProgress { index, bytes: b });
-        !ctrl.is_cancelled()
-    })
-    .map_err(|e| if e.kind() == io::ErrorKind::Interrupted { "cancelled".to_string() } else { format!("verify read: {e}") })?;
-    if len != job.written || got != job.expected {
-        return Err("checksum mismatch: the copy on disk does not match the source".into());
+/// Verify one written slot: flush, re-read bypassing the cache, compare to the source hash, then give it its real name.
+/// Only the main copy reports progress, so the verify bar still adds up to the plan's size.
+fn verify_slot(slot: Slot, job: &VerifyJob, ctrl: &Control, tx: &Sender<Event>, report: bool) -> Slot {
+    let Slot::Write { part, final_path, renamed } = slot else { return slot };
+    let res = (|| -> std::result::Result<(), String> {
+        File::open(&part).and_then(|f| fsutil::flush_best_effort(&f)).map_err(|e| format!("flush: {e}"))?;
+        let index = job.index;
+        let (got, len) = fsutil::hash_file(&part, true, |b| {
+            if report {
+                let _ = tx.send(Event::VerifyProgress { index, bytes: b });
+            }
+            !ctrl.is_cancelled()
+        })
+        .map_err(|e| if e.kind() == io::ErrorKind::Interrupted { "cancelled".to_string() } else { format!("verify read: {e}") })?;
+        if len != job.written || got != job.expected {
+            return Err("checksum mismatch: the copy on disk does not match the source".into());
+        }
+        if fs::symlink_metadata(&final_path).is_ok() {
+            return Err("a file appeared at the destination during the copy; not overwriting".into());
+        }
+        fs::rename(&part, &final_path).map_err(|e| format!("finalize: {e}"))?;
+        // Preserve the camera's modification time (best effort).
+        if let Ok(f) = File::options().read(true).open(&final_path) {
+            let _ = f.set_modified(job.modified);
+        }
+        Ok(())
+    })();
+    match res {
+        Ok(()) => Slot::Done { path: final_path, renamed },
+        Err(e) => {
+            let _ = fs::remove_file(&part);
+            Slot::Failed(e)
+        }
     }
-    if fs::symlink_metadata(&job.final_path).is_ok() {
-        return Err("a file appeared at the destination during the copy; not overwriting".into());
-    }
-    fs::rename(&job.part, &job.final_path).map_err(|e| format!("finalize: {e}"))?;
-    // Preserve the camera's modification time (best effort).
-    if let Ok(f) = File::options().read(true).open(&job.final_path) {
-        let _ = f.set_modified(job.modified);
-    }
-    Ok(())
+}
+
+fn is_cancelled_slot(s: &Slot) -> bool {
+    matches!(s, Slot::Failed(e) if e == "cancelled")
 }
 
 /// Run the plan to completion (blocking). Progress is reported through `tx`.
@@ -555,7 +769,7 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
 
     // Create every destination folder up front; a folder that can't be made fails only its own files.
     let mut bad_dirs: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
-    for dir in plan.dest_dirs() {
+    for dir in plan.dest_dirs().into_iter().chain(plan.mirror_dirs()) {
         if let Err(e) = prepare_dest_dir(&dir) {
             bad_dirs.insert(dir, e.to_string());
         }
@@ -568,73 +782,100 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
         let vevents = tx.clone();
         let mode = plan.mode;
         s.spawn(move || {
-            while let Ok(job) = vrx.recv() {
+            while let Ok(mut job) = vrx.recv() {
                 let _ = vevents.send(Event::Verifying { index: job.index });
+                let primary = std::mem::replace(&mut job.primary, Slot::Off);
+                let mirror = std::mem::replace(&mut job.mirror, Slot::Off);
                 if vctrl.is_cancelled() {
-                    let _ = fs::remove_file(&job.part);
+                    for slot in [&primary, &mirror] {
+                        if let Slot::Write { part, .. } = slot {
+                            let _ = fs::remove_file(part);
+                        }
+                    }
                     Tally::done(&vt, job.index, &job.name, job.size, Outcome::Cancelled);
                     continue;
                 }
-                match verify_job(&job, &vctrl, &vevents) {
-                    Ok(()) => {
-                        let removed = if mode == Mode::Move {
-                            removal(remove_original(&job.source, job.size, job.modified, &job.final_path))
-                        } else {
-                            Removal::NotRequested
-                        };
-                        Tally::done(&vt, job.index, &job.name, job.size, Outcome::Copied { dest: job.final_path.clone(), renamed: job.renamed, removed })
-                    }
-                    Err(e) if e == "cancelled" => {
-                        let _ = fs::remove_file(&job.part);
-                        Tally::done(&vt, job.index, &job.name, job.size, Outcome::Cancelled);
-                    }
-                    Err(e) => {
-                        let _ = fs::remove_file(&job.part);
-                        Tally::done(&vt, job.index, &job.name, job.size, Outcome::Failed(e));
-                    }
-                }
+                let primary = verify_slot(primary, &job, &vctrl, &vevents, true);
+                let mirror = verify_slot(mirror, &job, &vctrl, &vevents, false);
+                let outcome = if is_cancelled_slot(&primary) || is_cancelled_slot(&mirror) {
+                    Outcome::Cancelled
+                } else {
+                    outcome_for(primary, mirror, mode, &job.source, job.size, job.modified)
+                };
+                Tally::done(&vt, job.index, &job.name, job.size, outcome);
             }
         });
 
         let mut reserved = HashSet::new();
+        let mut reserved_mirror = HashSet::new();
         for (index, item) in plan.items.iter().enumerate() {
             if ctrl.is_cancelled() || !ctrl.checkpoint() {
                 Tally::done(&tally, index, &item.name, item.size, Outcome::Cancelled);
                 continue;
             }
             let _ = tx.send(Event::Started { index });
-            if let Some(e) = bad_dirs.get(&item.dest_dir) {
-                Tally::done(&tally, index, &item.name, item.size, Outcome::Failed(format!("cannot create destination: {e}")));
-                continue;
-            }
-            let (final_path, renamed) = match resolve_dest(&item.dest_dir, item, &mut reserved) {
-                Ok(Resolved::Skip(dest)) => {
-                    let _ = tx.send(Event::Progress { index, bytes: item.size });
-                    let _ = tx.send(Event::VerifyProgress { index, bytes: item.size });
-                    let removed =
-                        if plan.mode == Mode::Move { removal(remove_original(&item.source, item.size, item.modified, &dest)) } else { Removal::NotRequested };
-                    Tally::done(&tally, index, &item.name, item.size, Outcome::Skipped { dest, removed });
-                    continue;
+            let slot_for = |dir: &Path, reserved: &mut HashSet<String>| -> Slot {
+                if let Some(e) = bad_dirs.get(dir) {
+                    return Slot::Failed(format!("cannot create destination: {e}"));
                 }
-                Ok(Resolved::Use { final_path, renamed }) => (final_path, renamed),
-                Err(e) => {
-                    Tally::done(&tally, index, &item.name, item.size, Outcome::Failed(format!("checking destination: {e}")));
-                    continue;
+                match resolve_dest(dir, item, reserved) {
+                    Ok(Resolved::Skip(p)) => Slot::Skip(p),
+                    Ok(Resolved::Use { final_path, renamed }) => Slot::Write { part: part_path(&final_path), final_path, renamed },
+                    Err(e) => Slot::Failed(format!("checking destination: {e}")),
                 }
             };
-            let part = part_path(&final_path);
-            match copy_stream(&item.source, &part, ctrl, |b| {
+            let mut primary = slot_for(&item.dest_dir, &mut reserved);
+            if let Slot::Failed(e) = primary {
+                Tally::done(&tally, index, &item.name, item.size, Outcome::Failed(e));
+                continue;
+            }
+            let mut mirror = match &item.mirror_dir {
+                Some(d) => slot_for(d, &mut reserved_mirror),
+                None => Slot::Off,
+            };
+
+            // Which destinations need bytes written?
+            let mut parts: Vec<PathBuf> = vec![];
+            let mut which: Vec<bool> = vec![]; // true = primary, false = mirror
+            for (is_primary, slot) in [(true, &primary), (false, &mirror)] {
+                if let Slot::Write { part, .. } = slot {
+                    parts.push(part.clone());
+                    which.push(is_primary);
+                }
+            }
+            if parts.is_empty() {
+                // Everything needed is already in place (or the mirror failed to even start).
+                let _ = tx.send(Event::Progress { index, bytes: item.size });
+                let _ = tx.send(Event::VerifyProgress { index, bytes: item.size });
+                let outcome = outcome_for(primary, mirror, plan.mode, &item.source, item.size, item.modified);
+                Tally::done(&tally, index, &item.name, item.size, outcome);
+                continue;
+            }
+            let refs: Vec<&Path> = parts.iter().map(|p| p.as_path()).collect();
+            match copy_stream(&item.source, &refs, ctrl, |b| {
                 let _ = tx.send(Event::Progress { index, bytes: b });
             }) {
-                Ok((hash, written)) => {
+                Ok((hash, written, errs)) => {
+                    for (e, is_primary) in errs.into_iter().zip(&which) {
+                        if let Some(e) = e {
+                            *(if *is_primary { &mut primary } else { &mut mirror }) = Slot::Failed(e);
+                        }
+                    }
+                    if let Slot::Failed(e) = primary {
+                        // The main copy failed: the file counts as failed, and a mirror copy (if any) is discarded.
+                        if let Slot::Write { part, .. } = &mirror {
+                            let _ = fs::remove_file(part);
+                        }
+                        Tally::done(&tally, index, &item.name, item.size, Outcome::Failed(e));
+                        continue;
+                    }
                     let job = VerifyJob {
                         index,
-                        part,
-                        final_path,
+                        primary,
+                        mirror,
                         expected: hash,
                         written,
                         modified: item.modified,
-                        renamed,
                         name: item.name.clone(),
                         size: item.size,
                         source: item.source.clone(),
@@ -645,13 +886,21 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
                 }
                 Err(CopyErr::Cancelled) => Tally::done(&tally, index, &item.name, item.size, Outcome::Cancelled),
                 Err(CopyErr::Io(e)) => Tally::done(&tally, index, &item.name, item.size, Outcome::Failed(e)),
+                Err(CopyErr::Dests(errs)) => {
+                    // Every destination that needed bytes failed to take them.
+                    for (e, is_primary) in errs.into_iter().zip(&which) {
+                        *(if *is_primary { &mut primary } else { &mut mirror }) = Slot::Failed(e);
+                    }
+                    let outcome = outcome_for(primary, mirror, plan.mode, &item.source, item.size, item.modified);
+                    Tally::done(&tally, index, &item.name, item.size, outcome);
+                }
             }
         }
         drop(vtx); // lets the verifier finish its queue and exit
     });
 
     // Persist the directory entries of the finalized files.
-    for dir in plan.dest_dirs() {
+    for dir in plan.dest_dirs().into_iter().chain(plan.mirror_dirs()) {
         if let Ok(d) = File::open(&dir) {
             let _ = fsutil::flush_best_effort(&d);
         }
@@ -702,18 +951,28 @@ mod tests {
 mod verify_tests {
     use super::*;
 
-    fn job(dir: &Path, expected: blake3::Hash, written: u64) -> VerifyJob {
+    fn job(expected: blake3::Hash, written: u64) -> VerifyJob {
         VerifyJob {
             index: 0,
-            part: dir.join(".x.mp4.part"),
-            final_path: dir.join("x.mp4"),
+            primary: Slot::Off,
+            mirror: Slot::Off,
             expected,
             written,
             modified: SystemTime::now(),
-            renamed: false,
             name: "x.mp4".into(),
             size: written,
             source: PathBuf::new(),
+        }
+    }
+
+    fn slot(dir: &Path) -> Slot {
+        Slot::Write { part: dir.join(".x.mp4.part"), final_path: dir.join("x.mp4"), renamed: false }
+    }
+
+    fn failed(s: &Slot) -> &str {
+        match s {
+            Slot::Failed(e) => e,
+            _ => panic!("expected a failure"),
         }
     }
 
@@ -721,11 +980,10 @@ mod verify_tests {
     fn corrupted_copy_is_rejected_and_never_finalized() {
         let d = tempfile::tempdir().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
-        let ctrl = Control::default();
         std::fs::write(d.path().join(".x.mp4.part"), b"hello w0rld").unwrap(); // one flipped byte
-        let j = job(d.path(), blake3::hash(b"hello world"), 11);
-        let err = verify_job(&j, &ctrl, &tx).unwrap_err();
-        assert!(err.contains("checksum mismatch"), "{err}");
+        let j = job(blake3::hash(b"hello world"), 11);
+        let r = verify_slot(slot(d.path()), &j, &Control::default(), &tx, true);
+        assert!(failed(&r).contains("checksum mismatch"), "{}", failed(&r));
         assert!(!d.path().join("x.mp4").exists());
     }
 
@@ -734,8 +992,8 @@ mod verify_tests {
         let d = tempfile::tempdir().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         std::fs::write(d.path().join(".x.mp4.part"), b"hello").unwrap();
-        let j = job(d.path(), blake3::hash(b"hello world"), 11);
-        assert!(verify_job(&j, &Control::default(), &tx).is_err());
+        let j = job(blake3::hash(b"hello world"), 11);
+        assert!(matches!(verify_slot(slot(d.path()), &j, &Control::default(), &tx, true), Slot::Failed(_)));
         assert!(!d.path().join("x.mp4").exists());
     }
 
@@ -744,14 +1002,35 @@ mod verify_tests {
         let d = tempfile::tempdir().unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         std::fs::write(d.path().join(".x.mp4.part"), b"hello world").unwrap();
-        let j = job(d.path(), blake3::hash(b"hello world"), 11);
-        verify_job(&j, &Control::default(), &tx).unwrap();
+        let j = job(blake3::hash(b"hello world"), 11);
+        assert!(matches!(verify_slot(slot(d.path()), &j, &Control::default(), &tx, true), Slot::Done { .. }));
         assert_eq!(std::fs::read(d.path().join("x.mp4")).unwrap(), b"hello world");
         // a file that appeared in the meantime is never overwritten
         std::fs::write(d.path().join(".x.mp4.part"), b"hello world").unwrap();
         std::fs::write(d.path().join("x.mp4"), b"other").unwrap();
-        assert!(verify_job(&j, &Control::default(), &tx).is_err());
+        assert!(matches!(verify_slot(slot(d.path()), &j, &Control::default(), &tx, true), Slot::Failed(_)));
         assert_eq!(std::fs::read(d.path().join("x.mp4")).unwrap(), b"other");
+    }
+
+    #[test]
+    fn move_deletes_only_when_every_requested_copy_is_verified() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("card.mp4");
+        std::fs::write(&src, b"footage!").unwrap();
+        let mtime = std::fs::metadata(&src).unwrap().modified().unwrap();
+        let main = d.path().join("main.mp4");
+        std::fs::write(&main, b"footage!").unwrap();
+        let ok = |p: &Path| Slot::Done { path: p.to_path_buf(), renamed: false };
+        // mirror failed: the original must stay
+        let o = outcome_for(ok(&main), Slot::Failed("disk full".into()), Mode::Move, &src, 8, mtime);
+        assert!(matches!(o, Outcome::Copied { removed: Removal::Failed(_), mirror: Mirror::Failed(_), .. }), "{o:?}");
+        assert!(src.exists());
+        // mirror verified: now it goes
+        let mir = d.path().join("mirror.mp4");
+        std::fs::write(&mir, b"footage!").unwrap();
+        let o = outcome_for(ok(&main), ok(&mir), Mode::Move, &src, 8, mtime);
+        assert!(matches!(o, Outcome::Copied { removed: Removal::Removed, mirror: Mirror::Ok(_), .. }), "{o:?}");
+        assert!(!src.exists());
     }
 }
 
@@ -779,7 +1058,7 @@ mod removal_tests {
     #[test]
     fn deletes_when_everything_checks_out() {
         let f = fx();
-        remove_original(&f.src, 8, f.mtime, &f.dest).unwrap();
+        remove_original(&f.src, 8, f.mtime, &[&f.dest]).unwrap();
         assert!(!f.src.exists());
         assert!(f.dest.exists(), "the backup is never touched");
     }
@@ -788,10 +1067,10 @@ mod removal_tests {
     fn keeps_original_if_the_copy_is_missing_or_wrong_size() {
         let f = fx();
         std::fs::remove_file(&f.dest).unwrap();
-        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("no longer on the destination"));
+        assert!(remove_original(&f.src, 8, f.mtime, &[&f.dest]).unwrap_err().contains("no longer on the destination"));
         assert!(f.src.exists());
         std::fs::write(&f.dest, b"short").unwrap();
-        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("different size"));
+        assert!(remove_original(&f.src, 8, f.mtime, &[&f.dest]).unwrap_err().contains("different size"));
         assert!(f.src.exists());
     }
 
@@ -800,10 +1079,10 @@ mod removal_tests {
         let f = fx();
         // different mtime
         let later = f.mtime + Duration::from_secs(5);
-        assert!(remove_original(&f.src, 8, later, &f.dest).unwrap_err().contains("changed"));
+        assert!(remove_original(&f.src, 8, later, &[&f.dest]).unwrap_err().contains("changed"));
         // different size
         std::fs::write(&f.src, b"footage!!!").unwrap();
-        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("changed"));
+        assert!(remove_original(&f.src, 8, f.mtime, &[&f.dest]).unwrap_err().contains("changed"));
         assert!(f.src.exists());
     }
 
@@ -812,12 +1091,12 @@ mod removal_tests {
         let f = fx();
         let link = f.src.with_file_name("link.mp4");
         std::os::unix::fs::symlink(&f.src, &link).unwrap();
-        assert!(remove_original(&link, 8, f.mtime, &f.dest).is_err());
+        assert!(remove_original(&link, 8, f.mtime, &[&f.dest]).is_err());
         assert!(f.src.exists() && link.exists());
         // and a symlinked "copy" doesn't count as a backup
         let dlink = f.dest.with_file_name("dlink.mp4");
         std::os::unix::fs::symlink(&f.dest, &dlink).unwrap();
-        assert!(remove_original(&f.src, 8, f.mtime, &dlink).is_err());
+        assert!(remove_original(&f.src, 8, f.mtime, &[&dlink]).is_err());
         assert!(f.src.exists());
     }
 
@@ -825,7 +1104,7 @@ mod removal_tests {
     fn already_gone_is_reported_not_fatal() {
         let f = fx();
         std::fs::remove_file(&f.src).unwrap();
-        assert!(remove_original(&f.src, 8, f.mtime, &f.dest).unwrap_err().contains("already gone"));
+        assert!(remove_original(&f.src, 8, f.mtime, &[&f.dest]).unwrap_err().contains("already gone"));
     }
 
     #[test]
@@ -835,8 +1114,8 @@ mod removal_tests {
         std::fs::write(&d2, b"zzzz").unwrap();
         let m2 = std::fs::metadata(&d2).unwrap().modified().unwrap();
         let list = vec![
-            Original { source: f.src.clone(), size: 8, modified: f.mtime, dest: f.dest.clone() },
-            Original { source: d2.clone(), size: 4, modified: m2, dest: f.src.with_file_name("no-copy.mp4") }, // copy missing
+            Original { source: f.src.clone(), size: 8, modified: f.mtime, dest: f.dest.clone(), mirror: None },
+            Original { source: d2.clone(), size: 4, modified: m2, dest: f.src.with_file_name("no-copy.mp4"), mirror: None }, // copy missing
         ];
         let rep = delete_originals(&list);
         assert_eq!((rep.deleted, rep.bytes, rep.failures.len()), (1, 8, 1));

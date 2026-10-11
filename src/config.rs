@@ -23,6 +23,19 @@ pub struct Config {
     /// Default for each run: "copy" keeps originals on the card; "move" deletes each original once its copy is verified.
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// How the dated folders are chosen: "run" = one folder for the day you offload, "shoot" = a folder per day the
+    /// footage was recorded.
+    #[serde(default = "default_organize")]
+    pub organize: String,
+    /// Stop the computer from sleeping while a copy runs.
+    #[serde(default = "yes")]
+    pub keep_awake: bool,
+    /// What to do after a fully successful run: "nothing", "sleep" or "shutdown".
+    #[serde(default = "default_when_done")]
+    pub when_done: String,
+    /// Optional second drive: every file is also written and verified here, in the same pass ("" = off).
+    #[serde(default)]
+    pub mirror: String,
     #[serde(default, rename = "profile")]
     pub profiles: Vec<Profile>,
 }
@@ -63,6 +76,12 @@ fn default_icon() -> String {
 fn default_mode() -> String {
     "copy".into()
 }
+fn default_organize() -> String {
+    "run".into()
+}
+fn default_when_done() -> String {
+    "nothing".into()
+}
 fn yes() -> bool {
     true
 }
@@ -76,6 +95,10 @@ impl Default for Config {
             theme: default_theme(),
             notify: true,
             mode: default_mode(),
+            organize: default_organize(),
+            keep_awake: true,
+            when_done: default_when_done(),
+            mirror: String::new(),
             profiles: vec![
                 Profile {
                     name: "DJI Osmo Action".into(),
@@ -177,6 +200,18 @@ impl Config {
         if !matches!(self.mode.to_lowercase().as_str(), "copy" | "move") {
             bail!("mode must be \"copy\" or \"move\" (got \"{}\")", self.mode);
         }
+        if !matches!(self.organize.to_lowercase().as_str(), "run" | "shoot") {
+            bail!("organize must be \"run\" or \"shoot\" (got \"{}\")", self.organize);
+        }
+        if !matches!(self.when_done.to_lowercase().as_str(), "nothing" | "sleep" | "shutdown") {
+            bail!("when_done must be \"nothing\", \"sleep\" or \"shutdown\" (got \"{}\")", self.when_done);
+        }
+        if !self.mirror.trim().is_empty() && expand_tilde(self.mirror.trim()) == expand_tilde(self.destination.trim()) {
+            bail!("the mirror folder must be a different drive/folder than the backup destination");
+        }
+        if self.organize_by_shoot_date() {
+            self.render_naive_date(chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap_or_default())?;
+        }
         if self.profiles.is_empty() {
             bail!("no profiles defined");
         }
@@ -200,6 +235,23 @@ impl Config {
         use std::fmt::Write;
         let mut s = String::new();
         write!(s, "{}", when.format(&self.date_format)).map_err(|_| anyhow::anyhow!("invalid date_format '{}'", self.date_format))?;
+        Ok(s)
+    }
+
+    pub fn organize_by_shoot_date(&self) -> bool {
+        self.organize.eq_ignore_ascii_case("shoot")
+    }
+
+    pub fn mirror_base(&self) -> Option<PathBuf> {
+        (!self.mirror.trim().is_empty()).then(|| expand_tilde(self.mirror.trim()))
+    }
+
+    /// Render the dated folder name for a day the footage was shot.
+    pub fn render_naive_date(&self, d: chrono::NaiveDate) -> Result<String> {
+        use std::fmt::Write;
+        let mut s = String::new();
+        write!(s, "{}", d.format(&self.date_format))
+            .map_err(|_| anyhow::anyhow!("date_format '{}' can't be used with shoot dates (it needs a time of day)", self.date_format))?;
         Ok(s)
     }
 
@@ -425,5 +477,22 @@ mod tests {
         let p = d.path().join("c.toml");
         std::fs::write(&p, vec![b'#'; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
         assert!(Config::load(&p).is_err());
+    }
+
+    #[test]
+    fn new_options_default_off_and_validate() {
+        let c = Config::default();
+        assert_eq!((c.organize.as_str(), c.keep_awake, c.when_done.as_str(), c.mirror.as_str()), ("run", true, "nothing", ""));
+        assert!(c.mirror_base().is_none() && !c.organize_by_shoot_date());
+        let parse = |extra: &str| Config::from_toml(&format!("{extra}\n[[profile]]\nname='x'\nsources=['/a']\ninclude=['mp4']\n"));
+        assert!(parse("organize = 'shoot'").unwrap().organize_by_shoot_date());
+        assert!(parse("organize = 'weekly'").is_err());
+        assert!(parse("when_done = 'explode'").is_err());
+        assert!(parse("when_done = 'sleep'").is_ok());
+        assert!(parse("mirror = '/Volumes/Second'").unwrap().mirror_base().is_some());
+        assert!(parse("destination = '/a/b'\nmirror = '/a/b'").is_err(), "mirror can't be the destination");
+        assert!(parse("organize = 'shoot'\ndate_format = '%H:%M'").is_err(), "a time-only format can't name shoot days");
+        // old configs without the new keys still load
+        assert!(parse("").is_ok());
     }
 }

@@ -1,7 +1,7 @@
 //! Application state and input handling (rendering lives in `ui`).
 
 use crate::config::{self, Config, Profile};
-use crate::engine::{self, Control, Event, Mode, Original, Outcome, Plan, Removal, Summary};
+use crate::engine::{self, Control, Event, Mirror, Mode, Original, Outcome, Plan, Removal, Summary};
 use crate::fsutil;
 use crate::history::{self, Record};
 use crate::scan::{self, ScanResult};
@@ -94,6 +94,12 @@ pub struct Review {
     pub mode: Mode,
     /// Move mode asks for an explicit yes before starting.
     pub confirm_move: bool,
+    /// One folder per day the footage was shot (instead of one folder for today).
+    pub shoot_dates: bool,
+    /// Also write and verify every file on the second (mirror) drive.
+    pub mirror: bool,
+    /// The mirror's live status (only when a mirror folder is configured).
+    pub mirror_dest: Option<(PathBuf, DestLive)>,
 }
 
 impl Review {
@@ -165,8 +171,8 @@ pub enum ItemState {
     Queued,
     Copying(u64),
     Verifying(u64),
-    Copied { renamed: bool, removal: Removal },
-    Skipped { removal: Removal },
+    Copied { renamed: bool, removal: Removal, mirror: Mirror },
+    Skipped { removal: Removal, mirror: Mirror },
     Failed(String),
     Cancelled,
 }
@@ -181,6 +187,8 @@ pub struct Run {
     pub mode: Mode,
     /// Where each file's verified copy ended up (for deleting originals afterwards).
     pub dests: Vec<Option<PathBuf>>,
+    /// Where each file's verified second-drive copy ended up (when mirroring).
+    pub mirror_dests: Vec<Option<PathBuf>>,
     pub profiles: Vec<usize>,
     pub plan: Plan,
     pub state: Vec<ItemState>,
@@ -234,6 +242,10 @@ pub enum GField {
     DateFormat,
     Notify,
     Mode,
+    Organize,
+    Mirror,
+    KeepAwake,
+    WhenDone,
     Theme,
 }
 
@@ -324,6 +336,10 @@ pub struct App {
     /// Desktop notifications, eject and open actions. Disabled in tests.
     pub sys_actions: bool,
     pub list_height: usize,
+    /// Held while a copy runs when `keep_awake` is on.
+    pub awake: Option<sys::AwakeGuard>,
+    /// A pending sleep/shutdown after a clean run: when it fires, and what it does. Any key cancels it.
+    pub power_at: Option<(Instant, sys::WhenDone)>,
 }
 
 const SAMPLE_EVERY: Duration = Duration::from_millis(250);
@@ -365,6 +381,8 @@ impl App {
             hits: vec![],
             sys_actions: true,
             list_height: 10,
+            awake: None,
+            power_at: None,
         };
         app.refresh_live();
         app
@@ -418,6 +436,14 @@ impl App {
         {
             self.toast = None;
         }
+        if let Some((at, action)) = self.power_at
+            && Instant::now() >= at
+        {
+            self.power_at = None;
+            if self.sys_actions {
+                sys::power(action);
+            }
+        }
         match self.screen {
             Screen::Home if self.last_live.elapsed() > Duration::from_secs(1) => self.refresh_live(),
             Screen::Scanning => self.poll_scan(),
@@ -456,23 +482,17 @@ impl App {
             profiles.iter().filter_map(|i| self.profile(*i).map(|p| (*i, engine::profile_dest_dir(&self.cfg, p, &date)))).collect();
         let Some(first) = dirs.first() else { return };
         let dest_dir = if dirs.len() == 1 { first.1.clone() } else { self.profile(first.0).map(|p| self.cfg.dest_base_for(p).join(&date)).unwrap_or_default() };
-        let present = scan
-            .files
-            .iter()
-            .map(|f| {
-                dirs.iter()
-                    .find(|(p, _)| *p == f.profile)
-                    .map(|(_, d)| std::fs::symlink_metadata(d.join(f.path.file_name().unwrap_or_default())).map(|m| m.len() == f.size).unwrap_or(false))
-                    .unwrap_or(false)
-            })
-            .collect();
         let dates: Vec<NaiveDate> = scan.by_date().keys().copied().collect();
         let n = scan.files.len();
+        let mirror_dest = self.cfg.mirror_base().map(|m| {
+            let live = dest_live(&m);
+            (m, live)
+        });
         self.review = Some(Review {
             profiles,
             dirs,
             selected: vec![true; n],
-            present,
+            present: vec![false; n],
             cursor: 0,
             scroll: 0,
             dates,
@@ -483,14 +503,53 @@ impl App {
             error: None,
             mode: Mode::from_config(&self.cfg.mode),
             confirm_move: false,
+            shoot_dates: self.cfg.organize_by_shoot_date(),
+            mirror: mirror_dest.is_some(),
+            mirror_dest,
             scan,
         });
+        self.recompute_review();
         self.screen = Screen::Review;
+    }
+
+    /// Re-derive what depends on the review's folder options: where each file would land, which are already there,
+    /// and the folder shown to the user.
+    fn recompute_review(&mut self) {
+        let Some(rv) = &mut self.review else { return };
+        let now = Local::now();
+        let Ok(run_date) = self.cfg.render_date(now) else { return };
+        let mut cfg = self.cfg.clone();
+        cfg.organize = if rv.shoot_dates { "shoot" } else { "run" }.into();
+        rv.present = rv
+            .scan
+            .files
+            .iter()
+            .map(|f| {
+                cfg.profiles
+                    .get(f.profile)
+                    .and_then(|p| engine::file_dest_dir(&cfg, p, &run_date, f.date).ok())
+                    .map(|d| std::fs::symlink_metadata(d.join(f.path.file_name().unwrap_or_default())).map(|m| m.len() == f.size).unwrap_or(false))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if let Some(first) = rv.profiles.first().and_then(|i| cfg.profiles.get(*i)) {
+            rv.dest_dir = if rv.shoot_dates {
+                cfg.dest_base_for(first)
+            } else if rv.profiles.len() == 1 {
+                engine::profile_dest_dir(&cfg, first, &run_date)
+            } else {
+                cfg.dest_base_for(first).join(&run_date)
+            };
+            rv.dest = dest_live(&rv.dest_dir);
+        }
     }
 
     fn refresh_review_dest(&mut self) {
         if let Some(rv) = &mut self.review {
             rv.dest = dest_live(&rv.dest_dir);
+            if let Some((m, live)) = &mut rv.mirror_dest {
+                *live = dest_live(m);
+            }
         }
     }
 
@@ -526,15 +585,18 @@ impl App {
                         }
                     }
                     Event::Done { index, outcome } => {
-                        if let Outcome::Copied { dest, .. } | Outcome::Skipped { dest, .. } = &outcome
-                            && let Some(d) = run.dests.get_mut(index)
-                        {
-                            *d = Some(dest.clone());
+                        if let Outcome::Copied { dest, mirror, .. } | Outcome::Skipped { dest, mirror, .. } = &outcome {
+                            if let Some(d) = run.dests.get_mut(index) {
+                                *d = Some(dest.clone());
+                            }
+                            if let (Mirror::Ok(m), Some(d)) = (mirror, run.mirror_dests.get_mut(index)) {
+                                *d = Some(m.clone());
+                            }
                         }
                         if let Some(s) = run.state.get_mut(index) {
                             *s = match outcome {
-                                Outcome::Copied { renamed, removed, .. } => ItemState::Copied { renamed, removal: removed },
-                                Outcome::Skipped { removed, .. } => ItemState::Skipped { removal: removed },
+                                Outcome::Copied { renamed, removed, mirror, .. } => ItemState::Copied { renamed, removal: removed, mirror },
+                                Outcome::Skipped { removed, mirror, .. } => ItemState::Skipped { removal: removed, mirror },
                                 Outcome::Failed(e) => ItemState::Failed(e),
                                 Outcome::Cancelled => ItemState::Cancelled,
                             };
@@ -628,14 +690,27 @@ impl App {
         self.delete_confirm = false;
         self.run_mode = run.mode;
         if run.mode == Mode::Copy {
-            for ((item, st), dest) in run.plan.items.iter().zip(&run.state).zip(&run.dests) {
+            for (((item, st), dest), mirror) in run.plan.items.iter().zip(&run.state).zip(&run.dests).zip(&run.mirror_dests) {
+                // With a mirror, the second-drive copy must be verified too before an original counts as backed up.
+                let mirror_ok = item.mirror_dir.is_none() || mirror.is_some();
                 match (st, dest) {
-                    (ItemState::Copied { .. } | ItemState::Skipped { .. }, Some(d)) => {
-                        self.originals.push(Original { source: item.source.clone(), size: item.size, modified: item.modified, dest: d.clone() })
-                    }
+                    (ItemState::Copied { .. } | ItemState::Skipped { .. }, Some(d)) if mirror_ok => self.originals.push(Original {
+                        source: item.source.clone(),
+                        size: item.size,
+                        modified: item.modified,
+                        dest: d.clone(),
+                        mirror: mirror.clone(),
+                    }),
                     _ => self.ineligible += 1,
                 }
             }
+        }
+        // The computer-sleep hold ends with the run; a clean run may schedule sleep / shutdown (with a warning first).
+        self.awake = None;
+        self.power_at = None;
+        let when = sys::WhenDone::from_config(&self.cfg.when_done);
+        if when != sys::WhenDone::Nothing && !s.cancelled && s.failed == 0 && s.mirror_failures.is_empty() && s.move_failures.is_empty() {
+            self.power_at = Some((Instant::now() + sys::POWER_GRACE, when));
         }
         self.per_profile = per;
         self.summary = Some((run.profiles.clone(), s));
@@ -692,7 +767,13 @@ impl App {
             })
             .filter(|part| !part.files.is_empty())
             .collect();
-        let plan = match engine::build_batch_plan(&self.cfg, &parts, Local::now()) {
+        // The review's toggles override the saved defaults for this run only.
+        let mut run_cfg = self.cfg.clone();
+        run_cfg.organize = if rv.shoot_dates { "shoot" } else { "run" }.into();
+        if !rv.mirror {
+            run_cfg.mirror.clear();
+        }
+        let plan = match engine::build_batch_plan(&run_cfg, &parts, Local::now()) {
             Ok(p) => p,
             Err(e) => {
                 rv.error = Some(e.to_string());
@@ -723,6 +804,7 @@ impl App {
         self.run = Some(Run {
             mode: plan.mode,
             dests: vec![None; n],
+            mirror_dests: vec![None; n],
             profiles: parts.iter().map(|p| p.profile_index).collect(),
             plan,
             state: vec![ItemState::Queued; n],
@@ -744,6 +826,8 @@ impl App {
             paused_at: None,
             paused_total: Duration::ZERO,
         });
+        self.awake = (self.cfg.keep_awake && self.sys_actions).then(sys::AwakeGuard::new);
+        self.power_at = None;
         self.screen = Screen::Running;
     }
 
@@ -769,6 +853,11 @@ impl App {
                 return;
             }
             self.should_quit = true;
+            return;
+        }
+        if let Some((_, action)) = self.power_at.take() {
+            // Any key stops a pending sleep / shutdown (and is otherwise ignored).
+            self.toast(format!("Won't {} after all.", action.verb()), Level::Info);
             return;
         }
         if self.editor.input.is_some() && self.screen == Screen::Config {
@@ -855,6 +944,20 @@ impl App {
         }
         if key.code == KeyCode::Char('m') {
             rv.mode = rv.mode.toggled();
+            return;
+        }
+        if key.code == KeyCode::Char('o') {
+            rv.shoot_dates = !rv.shoot_dates;
+            self.recompute_review();
+            return;
+        }
+        if key.code == KeyCode::Char('r') {
+            if rv.mirror_dest.is_none() {
+                rv.error = Some("No second drive set. Add a mirror folder in settings (e on the home screen).".into());
+            } else {
+                rv.mirror = !rv.mirror;
+                rv.error = None;
+            }
             return;
         }
         let page = self.list_height.max(1);
@@ -1059,8 +1162,12 @@ impl App {
         let mut rows = vec![
             Row::Global(GField::Destination),
             Row::Global(GField::DateFormat),
-            Row::Global(GField::Notify),
             Row::Global(GField::Mode),
+            Row::Global(GField::Organize),
+            Row::Global(GField::Mirror),
+            Row::Global(GField::KeepAwake),
+            Row::Global(GField::WhenDone),
+            Row::Global(GField::Notify),
             Row::Global(GField::Theme),
         ];
         for i in 0..self.cfg.profiles.len() {
@@ -1081,6 +1188,21 @@ impl App {
             Row::Global(GField::Mode) => (
                 "Default mode".into(),
                 if self.cfg.mode.eq_ignore_ascii_case("move") { "move (delete originals once verified)" } else { "copy (keep originals)" }.into(),
+            ),
+            Row::Global(GField::Organize) => (
+                "Folders by".into(),
+                if self.cfg.organize_by_shoot_date() { "shoot date (a folder per day filmed)" } else { "today's date (one folder per offload)" }.into(),
+            ),
+            Row::Global(GField::Mirror) => ("Mirror drive".into(), if self.cfg.mirror.trim().is_empty() { String::new() } else { self.cfg.mirror.clone() }),
+            Row::Global(GField::KeepAwake) => ("Keep Mac awake".into(), if self.cfg.keep_awake { "on (while copying)" } else { "off" }.into()),
+            Row::Global(GField::WhenDone) => (
+                "When finished".into(),
+                match sys::WhenDone::from_config(&self.cfg.when_done) {
+                    sys::WhenDone::Nothing => "do nothing",
+                    sys::WhenDone::Sleep => "sleep the Mac (after a clean run)",
+                    sys::WhenDone::Shutdown => "shut down the Mac (after a clean run)",
+                }
+                .into(),
             ),
             Row::Global(GField::Theme) => ("Theme".into(), self.theme.name.into()),
             Row::Header(i) => (self.cfg.profiles[i].name.clone(), String::new()),
@@ -1146,6 +1268,21 @@ impl App {
             Row::Global(GField::Mode) => {
                 let mut next = self.cfg.clone();
                 next.mode = Mode::from_config(&next.mode).toggled().label().into();
+                self.commit(next, "Saved");
+            }
+            Row::Global(GField::Organize) => {
+                let mut next = self.cfg.clone();
+                next.organize = if next.organize_by_shoot_date() { "run" } else { "shoot" }.into();
+                self.commit(next, "Saved");
+            }
+            Row::Global(GField::KeepAwake) => {
+                let mut next = self.cfg.clone();
+                next.keep_awake = !next.keep_awake;
+                self.commit(next, "Saved");
+            }
+            Row::Global(GField::WhenDone) => {
+                let mut next = self.cfg.clone();
+                next.when_done = sys::WhenDone::from_config(&next.when_done).next().label().into();
                 self.commit(next, "Saved");
             }
             Row::Global(GField::Theme) => {
@@ -1216,6 +1353,7 @@ impl App {
         match row {
             Row::Global(GField::Destination) => next.destination = text.into(),
             Row::Global(GField::DateFormat) => next.date_format = text.into(),
+            Row::Global(GField::Mirror) => next.mirror = text.into(),
             Row::Field(i, f) => {
                 let p = &mut next.profiles[i];
                 match f {

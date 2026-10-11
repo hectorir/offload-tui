@@ -587,3 +587,132 @@ fn batch_move_deletes_from_each_card() {
     assert_eq!((s.copied, s.moved, s.failed), (2, 2, 0));
     assert!(!r.src.join("a.mp4").exists() && !sony.join("b.arw").exists());
 }
+
+// ---------- second drive (mirror) and shoot-date folders ----------
+
+fn with_mirror(r: &mut Rig) -> PathBuf {
+    let m = r._tmp.path().join("mirror-drive");
+    r.cfg.mirror = m.to_string_lossy().into();
+    m
+}
+
+fn set_mtime(path: &Path, when: std::time::SystemTime) {
+    fs::File::options().write(true).open(path).unwrap().set_modified(when).unwrap();
+}
+
+#[test]
+fn mirror_writes_and_verifies_both_copies_from_one_read() {
+    let mut r = rig();
+    let m = with_mirror(&mut r);
+    let big = pattern(3 * 1024 * 1024 + 17, 9);
+    fs::write(r.src.join("a.mp4"), &big).unwrap();
+    fs::write(r.src.join("b.wav"), pattern(2_000, 4)).unwrap();
+    let plan = plan_for(&r);
+    assert!(plan.is_mirrored());
+    let (s, ev) = run(&plan);
+    assert_eq!((s.copied, s.failed, s.mirrored), (2, 0, 2), "{:?} {:?}", s.failures, s.mirror_failures);
+    let day = plan.dest_dir.strip_prefix(&r.dest).unwrap().to_path_buf();
+    assert_eq!(fs::read(plan.dest_dir.join("a.mp4")).unwrap(), big);
+    assert_eq!(fs::read(m.join(&day).join("a.mp4")).unwrap(), big, "the mirror is byte-identical");
+    assert_eq!(list(&m.join(&day)), ["a.mp4", "b.wav"], "no .part leftovers on the mirror");
+    assert!(ev.iter().any(|e| matches!(e, Event::Done { outcome: Outcome::Copied { mirror: engine::Mirror::Ok(_), .. }, .. })));
+    // progress still adds up to the plan size once, not twice
+    let copied: u64 = ev.iter().filter_map(|e| if let Event::Progress { bytes, .. } = e { Some(*bytes) } else { None }).sum();
+    assert_eq!(copied, plan.total_bytes());
+}
+
+#[test]
+fn a_failed_mirror_never_fails_the_main_copy_and_blocks_move() {
+    let mut r = rig();
+    let m = with_mirror(&mut r);
+    fs::write(r.src.join("a.mp4"), pattern(10_000, 1)).unwrap();
+    let mut plan = plan_for(&r);
+    // Make the mirror folder impossible to create: a plain file sits where its parent should be.
+    fs::write(&m, b"not a directory").unwrap();
+    plan.mode = engine::Mode::Move;
+    let (s, ev) = run(&plan);
+    assert_eq!((s.copied, s.failed, s.mirrored), (1, 0, 0));
+    assert_eq!(s.mirror_failures.len(), 1);
+    assert!(plan.dest_dir.join("a.mp4").exists(), "the main copy is fine");
+    assert!(r.src.join("a.mp4").exists(), "move must not delete the original when the mirror failed");
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::Done { outcome: Outcome::Copied { removed: engine::Removal::Failed(_), mirror: engine::Mirror::Failed(_), .. }, .. }))
+    );
+}
+
+#[test]
+fn move_with_a_mirror_deletes_the_original_only_after_both_verify() {
+    let mut r = rig();
+    let m = with_mirror(&mut r);
+    fs::write(r.src.join("a.mp4"), pattern(10_000, 1)).unwrap();
+    let mut plan = plan_for(&r);
+    plan.mode = engine::Mode::Move;
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.moved, s.mirrored), (1, 1, 1));
+    assert!(!r.src.join("a.mp4").exists());
+    let day = plan.dest_dir.strip_prefix(&r.dest).unwrap().to_path_buf();
+    assert!(plan.dest_dir.join("a.mp4").exists() && m.join(day).join("a.mp4").exists());
+}
+
+#[test]
+fn rerun_with_a_new_mirror_only_fills_the_mirror() {
+    let mut r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(20_000, 2)).unwrap();
+    let (s, _) = run(&plan_for(&r)); // first without a mirror
+    assert_eq!(s.copied, 1);
+    let m = with_mirror(&mut r);
+    let plan = plan_for(&r);
+    let (s, ev) = run(&plan);
+    assert_eq!((s.copied, s.skipped, s.mirrored), (0, 1, 1), "main copy is skipped by checksum, the mirror is filled");
+    let day = plan.dest_dir.strip_prefix(&r.dest).unwrap().to_path_buf();
+    assert_eq!(fs::read(m.join(day).join("a.mp4")).unwrap(), pattern(20_000, 2));
+    assert!(ev.iter().any(|e| matches!(e, Event::Done { outcome: Outcome::Skipped { mirror: engine::Mirror::Ok(_), .. }, .. })));
+}
+
+#[test]
+fn preflight_blocks_a_missing_mirror_drive() {
+    let mut r = rig();
+    fs::write(r.src.join("a.mp4"), b"x").unwrap();
+    r.cfg.mirror = "/Volumes/definitely-not-mounted-zz/backup".into();
+    let plan = plan_for(&r);
+    let err = engine::preflight(&plan).unwrap_err();
+    assert!(err.contains("mirror") && err.contains("not mounted"), "{err}");
+    assert!(!Path::new("/Volumes/definitely-not-mounted-zz").exists(), "nothing was created");
+}
+
+#[test]
+fn shoot_date_mode_makes_a_folder_per_day_filmed() {
+    let mut r = rig();
+    r.cfg.organize = "shoot".into();
+    let day1 = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 86_400);
+    let day2 = std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 86_400);
+    fs::write(r.src.join("old.mp4"), pattern(500, 1)).unwrap();
+    fs::write(r.src.join("new.mp4"), pattern(500, 2)).unwrap();
+    fs::write(r.src.join("new2.mp4"), pattern(500, 3)).unwrap();
+    set_mtime(&r.src.join("old.mp4"), day1);
+    set_mtime(&r.src.join("new.mp4"), day2);
+    set_mtime(&r.src.join("new2.mp4"), day2);
+    let plan = plan_for(&r);
+    let fmt = |t: std::time::SystemTime| chrono::DateTime::<chrono::Local>::from(t).format("%Y-%m-%d").to_string();
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.failed), (3, 0));
+    assert_eq!(plan.dest_dir, r.dest, "the shown destination is the base folder");
+    assert_eq!(list(&r.dest.join(fmt(day1)).join("DJI")), ["old.mp4"]);
+    assert_eq!(list(&r.dest.join(fmt(day2)).join("DJI")), ["new.mp4", "new2.mp4"]);
+    assert!(!r.dest.join(chrono::Local::now().format("%Y-%m-%d").to_string()).exists(), "no folder for today");
+}
+
+#[test]
+fn shoot_date_and_mirror_combine() {
+    let mut r = rig();
+    r.cfg.organize = "shoot".into();
+    let m = with_mirror(&mut r);
+    fs::write(r.src.join("old.mp4"), pattern(500, 1)).unwrap();
+    let day = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 86_400);
+    set_mtime(&r.src.join("old.mp4"), day);
+    let (s, _) = run(&plan_for(&r));
+    assert_eq!((s.copied, s.mirrored), (1, 1));
+    let d = chrono::DateTime::<chrono::Local>::from(day).format("%Y-%m-%d").to_string();
+    assert!(r.dest.join(&d).join("DJI/old.mp4").exists() && m.join(&d).join("DJI/old.mp4").exists());
+}

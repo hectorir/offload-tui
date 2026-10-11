@@ -1,14 +1,14 @@
 //! Rendering. Pure functions of `App` state (plus recording click targets).
 
 use crate::app::*;
-use crate::engine::{Mode, Removal};
+use crate::engine::{Mirror, Mode, Removal};
 use crate::fsutil::{human_bytes, human_duration, human_rate, sanitize_display, volume_root};
 use crate::theme::Theme;
 use crate::widgets::{self, WORDMARK, gradient_bar, solid_bar, spinner};
 use chrono::{DateTime, Datelike, Local};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Sparkline, Wrap};
 use std::path::Path;
@@ -117,6 +117,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     ("a", "all/none"),
                     ("tab", "dates"),
                     ("m", if rv.mode == Mode::Move { "mode: MOVE" } else { "mode: copy" }),
+                    ("o", if rv.shoot_dates { "by shoot date" } else { "by today" }),
+                    ("r", if rv.mirror { "mirror on" } else { "mirror off" }),
                     ("enter", "go"),
                     ("esc", "back"),
                     ("?", "help"),
@@ -507,7 +509,7 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
     let n_types = rv.scan.by_ext().len() as u16;
     let cams_h = if rv.is_batch() { rv.profiles.len() as u16 + 2 } else { 0 };
     let [sum_a, cams_a, src_a, typ_a, date_a] = Layout::vertical([
-        Constraint::Length(9),
+        Constraint::Length(12 + u16::from(rv.mirror_dest.is_some()) * 2),
         Constraint::Length(cams_h),
         Constraint::Length(n_src + 2),
         Constraint::Length(n_types.max(1) + 2),
@@ -531,22 +533,46 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("into      ", dim(&t)),
-            Span::styled(sanitize_display(&trunc_path(&rv.dest_dir.display().to_string(), si.width.saturating_sub(10) as usize)), fg(&t)),
+            Span::styled(
+                sanitize_display(&trunc_path(
+                    &if rv.shoot_dates { format!("{}/‹day shot›", rv.dest_dir.display()) } else { rv.dest_dir.display().to_string() },
+                    si.width.saturating_sub(10) as usize,
+                )),
+                fg(&t),
+            ),
         ]),
         storage_line(&t, "backup", &rv.dest, si.width as usize),
     ];
+    sl.push(Line::from(vec![
+        Span::styled("folders   ", dim(&t)),
+        Span::styled(if rv.shoot_dates { "by SHOOT date" } else { "by today's date" }, if rv.shoot_dates { bold(&t) } else { fg(&t) }),
+        Span::styled(if rv.shoot_dates { " · per day filmed" } else { " · one per offload" }, dim(&t)),
+        Span::styled(" (o)", dim(&t)),
+    ]));
+    if let Some((path, live)) = &rv.mirror_dest {
+        if rv.mirror {
+            sl.push(storage_line(&t, "mirror", live, si.width as usize));
+            sl.push(Line::from(vec![
+                Span::styled("          ", dim(&t)),
+                Span::styled(sanitize_display(&trunc_path(&path.display().to_string(), si.width.saturating_sub(16) as usize)), fg(&t)),
+                Span::styled("  (r)", dim(&t)),
+            ]));
+        } else {
+            sl.push(Line::from(vec![Span::styled("mirror    ", dim(&t)), Span::styled("off for this run", dim(&t)), Span::styled("  (r)", dim(&t))]));
+        }
+    }
     sl.push(Line::from(match rv.mode {
         Mode::Copy => vec![
             Span::styled("mode      ", dim(&t)),
             Span::styled("COPY", bold(&t)),
             Span::styled(" · originals stay on the card", dim(&t)),
-            Span::styled("  (m)", dim(&t)),
+            Span::styled(" (m)", dim(&t)),
         ],
         Mode::Move => vec![
             Span::styled("mode      ", dim(&t)),
             Span::styled("MOVE", Style::default().fg(t.warn).add_modifier(Modifier::BOLD)),
             Span::styled(" · originals deleted once verified", Style::default().fg(t.warn)),
-            Span::styled("  (m)", dim(&t)),
+            Span::styled(" (m)", dim(&t)),
         ],
     }));
     if rv.confirm_move {
@@ -558,6 +584,8 @@ fn draw_review(f: &mut Frame, app: &mut App, area: Rect) {
         sl.push(Line::from(Span::styled(format!("⚠ {e}"), Style::default().fg(t.err).add_modifier(Modifier::BOLD))));
     } else if !rv.dest.mounted {
         sl.push(Line::from(Span::styled("⚠ backup drive not mounted", Style::default().fg(t.err))));
+    } else if rv.mirror && rv.mirror_dest.as_ref().is_some_and(|(_, l)| !l.mounted) {
+        sl.push(Line::from(Span::styled("⚠ second (mirror) drive not mounted - press r to skip it", Style::default().fg(t.err))));
     } else if !rv.enough_space() {
         sl.push(Line::from(Span::styled("⚠ not enough free space", Style::default().fg(t.err))));
     } else {
@@ -676,30 +704,42 @@ fn state_cells<'a>(t: &Theme, st: &ItemState, size: u64, frame: usize, w: usize)
             v.push(Span::styled(format!(" verifying {:>3.0}%", r * 100.0), Style::default().fg(t.accent2)));
             (Span::styled(spinner(frame), Style::default().fg(t.accent2)), v)
         }
-        ItemState::Copied { renamed, removal } => {
+        ItemState::Copied { renamed, removal, mirror } => {
             let (text, c) = match (removal, renamed) {
                 (Removal::Removed, _) => ("verified · moved (original deleted)".to_string(), t.ok),
                 (Removal::Failed(e), _) => (format!("verified, but original NOT deleted: {}", trunc(&sanitize_display(e), 50)), t.warn),
                 (_, true) => ("verified · kept both (renamed)".to_string(), t.warn),
                 _ => ("verified".to_string(), t.ok),
             };
+            let (extra, ec) = mirror_note(mirror, t);
+            let bad = matches!(removal, Removal::Failed(_)) || matches!(mirror, Mirror::Failed(_));
             (
-                Span::styled("✓", Style::default().fg(if matches!(removal, Removal::Failed(_)) { t.warn } else { t.ok })),
-                vec![Span::styled(text, Style::default().fg(c))],
+                Span::styled("✓", Style::default().fg(if bad { t.warn } else { t.ok })),
+                vec![Span::styled(text, Style::default().fg(c)), Span::styled(extra, Style::default().fg(ec))],
             )
         }
-        ItemState::Skipped { removal } => {
+        ItemState::Skipped { removal, mirror } => {
             let (text, c) = match removal {
                 Removal::Removed => ("already on destination · original deleted".to_string(), t.ok),
                 Removal::Failed(e) => (format!("already there, but original NOT deleted: {}", trunc(&sanitize_display(e), 40)), t.warn),
                 Removal::NotRequested => ("already on destination (checksum match)".to_string(), t.dim),
             };
-            (Span::styled("↷", dim(t)), vec![Span::styled(text, Style::default().fg(c))])
+            let (extra, ec) = mirror_note(mirror, t);
+            (Span::styled("↷", dim(t)), vec![Span::styled(text, Style::default().fg(c)), Span::styled(extra, Style::default().fg(ec))])
         }
         ItemState::Failed(e) => {
             (Span::styled("✗", Style::default().fg(t.err)), vec![Span::styled(trunc(&sanitize_display(e), 60), Style::default().fg(t.err))])
         }
         ItemState::Cancelled => (Span::styled("−", Style::default().fg(t.warn)), vec![Span::styled("cancelled", Style::default().fg(t.warn))]),
+    }
+}
+
+/// The "· mirrored" suffix on a finished file row.
+fn mirror_note(m: &Mirror, t: &Theme) -> (String, Color) {
+    match m {
+        Mirror::Off => (String::new(), t.dim),
+        Mirror::Ok(_) => (" · mirrored".to_string(), t.ok),
+        Mirror::Failed(e) => (format!(" · MIRROR FAILED: {}", trunc(&sanitize_display(e), 36)), t.warn),
     }
 }
 
@@ -923,8 +963,32 @@ fn draw_summary(f: &mut Frame, app: &mut App, area: Rect) {
         }
         lines.push(Line::from(""));
     }
+    if s.mirrored > 0 || !s.mirror_failures.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("mirror     ", dim(&t)),
+            Span::styled(format!("{} files verified on the second drive", s.mirrored), bold(&t)),
+            Span::styled(
+                if s.mirror_failures.is_empty() { String::new() } else { format!("  ·  {} FAILED", s.mirror_failures.len()) },
+                Style::default().fg(t.err).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for (n, e) in s.mirror_failures.iter().take(4) {
+            lines.push(Line::from(vec![
+                Span::styled("⚠ ", Style::default().fg(t.warn)),
+                Span::styled(format!("{}: ", trunc(&sanitize_display(n), 28)), bold(&t)),
+                Span::styled(format!("not on the second drive: {}", trunc(&sanitize_display(e), 40)), Style::default().fg(t.warn)),
+            ]));
+        }
+    }
     if s.failed == 0 && !s.cancelled {
         lines.push(Line::from(Span::styled("Every copied file was re-read from disk and matched its source checksum.", dim(&t))));
+    }
+    if let Some((at, action)) = app.power_at {
+        let secs = at.saturating_duration_since(std::time::Instant::now()).as_secs();
+        lines.push(Line::from(Span::styled(
+            format!("⏻ This Mac will {} in {secs}s - press any key to cancel", action.verb()),
+            Style::default().fg(t.warn).add_modifier(Modifier::BOLD),
+        )));
     }
     match (app.run_mode, &app.deleted) {
         (Mode::Move, _) => {
@@ -1152,6 +1216,8 @@ fn draw_help(f: &mut Frame, app: &App, full: Rect) {
         kv("tab", "switch between files and shoot dates"),
         kv("a", "select all / none"),
         kv("m", "mode: copy (keep) or move (delete originals)"),
+        kv("o", "folders: by today's date, or by the day each clip was shot"),
+        kv("r", "mirror to your second drive on/off (if one is set)"),
         kv("enter", "start copying (checks free space first)"),
         sec("While copying"),
         kv("p", "pause / resume"),

@@ -37,6 +37,24 @@ enum Cmd {
         /// Copy: keep the originals (overrides `mode = "move"` in the config)
         #[arg(long = "copy", id = "keep")]
         keep: bool,
+        /// One folder per day the footage was shot (instead of one for today)
+        #[arg(long, conflicts_with = "by_run_date")]
+        by_shoot_date: bool,
+        /// One folder for today's offload (overrides `organize = "shoot"` in the config)
+        #[arg(long)]
+        by_run_date: bool,
+        /// Also write and verify every file on this second drive/folder
+        #[arg(long, value_name = "FOLDER", conflicts_with = "no_mirror")]
+        mirror: Option<String>,
+        /// Skip the configured mirror for this run
+        #[arg(long)]
+        no_mirror: bool,
+        /// Don't hold the computer awake during the copy
+        #[arg(long)]
+        no_awake: bool,
+        /// After a clean run: nothing, sleep or shutdown
+        #[arg(long, value_name = "ACTION", value_parser = ["nothing", "sleep", "shutdown"])]
+        when_done: Option<String>,
     },
     /// List profiles and whether their cards are connected
     Profiles,
@@ -82,7 +100,7 @@ fn real_main() -> Result<()> {
             let cfg = Config::load_or_default(&cfg_path)?;
             tui::run(App::new(cfg, paths))
         }
-        Some(Cmd::Run { profiles, all, yes, dry_run, move_, keep }) => {
+        Some(Cmd::Run { profiles, all, yes, dry_run, move_, keep, by_shoot_date, by_run_date, mirror, no_mirror, no_awake, when_done }) => {
             let mode = if move_ {
                 Some(offload::engine::Mode::Move)
             } else if keep {
@@ -90,11 +108,23 @@ fn real_main() -> Result<()> {
             } else {
                 None
             };
+            let over = headless::Overrides {
+                shoot_dates: if by_shoot_date {
+                    Some(true)
+                } else if by_run_date {
+                    Some(false)
+                } else {
+                    None
+                },
+                mirror: if no_mirror { Some(String::new()) } else { mirror },
+                keep_awake: no_awake.then_some(false),
+                when_done,
+            };
             let cfg = Config::load_or_default(&cfg_path)?;
             let stdin = std::io::stdin();
             let code = headless::run(
                 &cfg,
-                &headless::Options { names: &profiles, all, yes, dry_run, mode },
+                &headless::Options { names: &profiles, all, yes, dry_run, mode, over },
                 &paths.history,
                 &mut stdin.lock(),
                 &mut std::io::stdout(),

@@ -340,3 +340,89 @@ fn move_and_copy_flags_conflict() {
     assert!(!o.status.success());
     assert!(e.p("card/DCIM/100/A.MP4").exists());
 }
+
+#[test]
+fn mirror_flag_writes_both_drives_and_reports_it() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let mirror = e.p("second");
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--mirror", mirror.to_str().unwrap()]).output().unwrap();
+    assert!(o.status.success(), "{}", out(&o));
+    let s = out(&o);
+    assert!(s.contains("Mirroring every file to") && s.contains("(mirrored)") && s.contains("2 files verified on the second drive"), "{s}");
+    assert_eq!(fs::read(mirror.join(chrono_today()).join("Cam/A.MP4")).unwrap(), vec![7u8; 100_000]);
+    assert_eq!(fs::read(e.p("backup").join(chrono_today()).join("Cam/B.wav")).unwrap(), vec![8u8; 50_000]);
+}
+
+#[test]
+fn no_mirror_flag_overrides_the_config() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let text = fs::read_to_string(&cfg).unwrap();
+    fs::write(&cfg, format!("mirror = '{}'\n{text}", e.p("second").display())).unwrap();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--no-mirror"]).output().unwrap();
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(!e.p("second").exists());
+}
+
+#[test]
+fn by_shoot_date_dry_run_shows_the_day_folders() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+    fs::File::options().write(true).open(e.p("card/DCIM/100/A.MP4")).unwrap().set_modified(old).unwrap();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--dry-run", "--by-shoot-date"]).output().unwrap();
+    let s = out(&o);
+    let day = chrono::DateTime::<chrono::Local>::from(old).format("%Y-%m-%d").to_string();
+    assert!(s.contains("one folder per shoot day") && s.contains(&format!("-> {day}/Cam")), "{s}");
+    assert!(!e.p("backup").exists());
+}
+
+#[test]
+fn by_shoot_date_and_by_run_date_conflict() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--by-shoot-date", "--by-run-date", "--yes"]).output().unwrap();
+    assert!(!o.status.success());
+}
+
+#[test]
+fn when_done_is_validated_and_only_announced_in_test_mode() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    let o = e.cmd().args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--when-done", "explode"]).output().unwrap();
+    assert!(!o.status.success(), "unknown action is refused");
+    let o = e
+        .cmd()
+        .env("OFFLOAD_TEST_NO_POWER", "1")
+        .args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--when-done", "sleep", "--no-awake"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", out(&o));
+    assert!(out(&o).contains("(test mode) would go to sleep now"), "{}", out(&o));
+}
+
+#[test]
+fn no_power_action_after_a_dry_run_or_a_failed_run() {
+    let e = Env::new();
+    let cfg = e.write_config();
+    // dry run
+    let o = e
+        .cmd()
+        .env("OFFLOAD_TEST_NO_POWER", "1")
+        .args(["--config", cfg.to_str().unwrap(), "run", "test", "--dry-run", "--when-done", "shutdown"])
+        .output()
+        .unwrap();
+    assert!(!out(&o).contains("would shut down"), "{}", out(&o));
+    // a mirror that can't be created: exit code 1 and no sleep
+    let blocker = e.p("blocker");
+    fs::write(&blocker, b"x").unwrap();
+    let o = e
+        .cmd()
+        .env("OFFLOAD_TEST_NO_POWER", "1")
+        .args(["--config", cfg.to_str().unwrap(), "run", "test", "--yes", "--mirror", blocker.to_str().unwrap(), "--when-done", "shutdown"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(out(&o).contains("mirror failed") && !out(&o).contains("would shut down"), "{}", out(&o));
+}

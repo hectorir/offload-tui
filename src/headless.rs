@@ -1,7 +1,7 @@
 //! Non-interactive `offload run`: scriptable copies with plain-text output.
 
 use crate::config::Config;
-use crate::engine::{self, Control, Event, Mode, Outcome, Removal};
+use crate::engine::{self, Control, Event, Mirror, Mode, Outcome, Removal};
 use crate::fsutil::{human_bytes, human_duration, human_rate, sanitize_display};
 use crate::{history, scan};
 use anyhow::{Result, bail};
@@ -25,10 +25,38 @@ pub struct Options<'a> {
     pub dry_run: bool,
     /// Force copy or move for this run; `None` uses the config's `mode`.
     pub mode: Option<Mode>,
+    pub over: Overrides,
+}
+
+/// Per-run overrides of config settings (each `None` keeps the config's value).
+#[derive(Debug, Clone, Default)]
+pub struct Overrides {
+    /// Folders per shoot day (true) or per offload day (false).
+    pub shoot_dates: Option<bool>,
+    /// Mirror folder; an empty string turns mirroring off.
+    pub mirror: Option<String>,
+    pub keep_awake: Option<bool>,
+    /// "nothing", "sleep" or "shutdown".
+    pub when_done: Option<String>,
 }
 
 pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<i32> {
-    let Options { names, all, yes, dry_run, mode } = *opts;
+    let Options { names, all, yes, dry_run, mode, ref over } = *opts;
+    let mut cfg_owned = cfg.clone();
+    if let Some(shoot) = over.shoot_dates {
+        cfg_owned.organize = if shoot { "shoot" } else { "run" }.into();
+    }
+    if let Some(m) = &over.mirror {
+        cfg_owned.mirror = m.clone();
+    }
+    if let Some(k) = over.keep_awake {
+        cfg_owned.keep_awake = k;
+    }
+    if let Some(w) = &over.when_done {
+        cfg_owned.when_done = w.clone();
+    }
+    cfg_owned.validate()?;
+    let cfg = &cfg_owned;
     let mode = mode.unwrap_or_else(|| Mode::from_config(&cfg.mode));
     // Resolve which cameras to include, in config order, without duplicates.
     let mut idxs: Vec<usize> = vec![];
@@ -88,12 +116,21 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
         .collect();
     let mut plan = engine::build_batch_plan(cfg, &batch_parts, chrono::Local::now())?;
     plan.mode = mode;
-    writeln!(out, "{} files, {} -> {}", plan.items.len(), human_bytes(plan.total_bytes()), sanitize_display(&plan.dest_dir.display().to_string()))?;
+    let shoot = if cfg.organize_by_shoot_date() { " (one folder per shoot day)" } else { "" };
+    writeln!(out, "{} files, {} -> {}{shoot}", plan.items.len(), human_bytes(plan.total_bytes()), sanitize_display(&plan.dest_dir.display().to_string()))?;
+    if let Some(m) = cfg.mirror_base() {
+        writeln!(out, "Mirroring every file to {} as well", sanitize_display(&m.display().to_string()))?;
+    }
     if dry_run {
         for it in &plan.items {
             let tag = if batch { format!("[{}] ", sanitize_display(&cfg.profiles[it.group].name)) } else { String::new() };
             let verb = if mode == Mode::Move { "would move" } else { "would copy" };
-            writeln!(out, "  {verb} {tag}{}  ({})", sanitize_display(&it.name), human_bytes(it.size))?;
+            let rel = it.dest_dir.strip_prefix(&plan.dest_dir).ok().filter(|r| !r.as_os_str().is_empty());
+            let into = match rel {
+                Some(r) if cfg.organize_by_shoot_date() => format!("  -> {}", sanitize_display(&r.display().to_string())),
+                _ => String::new(),
+            };
+            writeln!(out, "  {verb} {tag}{}  ({}){into}", sanitize_display(&it.name), human_bytes(it.size))?;
         }
         writeln!(out, "Dry run: nothing was written.")?;
         return Ok(0);
@@ -121,6 +158,7 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
     unsafe {
         libc::signal(libc::SIGINT, on_sigint as *const () as libc::sighandler_t);
     }
+    let _awake = (cfg.keep_awake).then(crate::sys::AwakeGuard::new);
     let ctrl = Control::new();
     let (tx, rx) = std::sync::mpsc::channel();
     let p2 = plan.clone();
@@ -142,9 +180,15 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
                 let line = match outcome {
                     Outcome::Copied { removed: Removal::Removed, .. } => format!("moved      {name} (verified, original deleted)"),
                     Outcome::Copied { removed: Removal::Failed(e), .. } => format!("verified   {name} (original NOT deleted: {})", sanitize_display(&e)),
+                    Outcome::Copied { mirror: Mirror::Failed(e), .. } => format!("verified   {name} (MIRROR FAILED: {})", sanitize_display(&e)),
+                    Outcome::Copied { renamed: true, mirror: Mirror::Ok(_), .. } => format!("verified (name clashed, kept both; mirrored)  {name}"),
                     Outcome::Copied { renamed: true, .. } => format!("verified (name clashed, kept both)  {name}"),
+                    Outcome::Copied { mirror: Mirror::Ok(_), .. } => format!("verified   {name} (mirrored)"),
                     Outcome::Copied { .. } => format!("verified   {name}"),
                     Outcome::Skipped { removed: Removal::Removed, .. } => format!("skipped    {name} (identical copy already there; original deleted)"),
+                    Outcome::Skipped { mirror: Mirror::Failed(e), .. } => {
+                        format!("skipped    {name} (identical copy already there; MIRROR FAILED: {})", sanitize_display(&e))
+                    }
                     Outcome::Skipped { .. } => format!("skipped    {name} (identical copy already there)"),
                     Outcome::Failed(e) => format!("FAILED     {name}: {}", sanitize_display(&e)),
                     Outcome::Cancelled => format!("cancelled  {name}"),
@@ -226,5 +270,35 @@ pub fn run(cfg: &Config, opts: &Options, history_path: &Path, input: &mut dyn Bu
     if mode == Mode::Move {
         writeln!(out, "{} originals deleted from the card, {} kept", summary.moved, summary.move_failures.len())?;
     }
-    Ok(if summary.failed > 0 || summary.cancelled { 1 } else { 0 })
+    if plan.is_mirrored() {
+        writeln!(out, "{} files verified on the second drive, {} failed there", summary.mirrored, summary.mirror_failures.len())?;
+        for (n, e) in summary.mirror_failures.iter().take(10) {
+            writeln!(out, "  mirror failed: {}: {}", sanitize_display(n), sanitize_display(e))?;
+        }
+    }
+    let clean = summary.failed == 0 && !summary.cancelled && summary.mirror_failures.is_empty() && summary.move_failures.is_empty();
+    if clean {
+        let when = crate::sys::WhenDone::from_config(&cfg.when_done);
+        if when != crate::sys::WhenDone::Nothing {
+            let test_mode = std::env::var_os("OFFLOAD_TEST_NO_POWER").is_some();
+            if test_mode {
+                writeln!(out, "(test mode) would {} now", when.verb())?;
+            } else {
+                let secs = crate::sys::POWER_GRACE.as_secs();
+                writeln!(out, "This computer will {} in {secs}s. Press Ctrl-C to cancel.", when.verb())?;
+                out.flush()?;
+                let deadline = std::time::Instant::now() + crate::sys::POWER_GRACE;
+                INTERRUPTED.store(false, Ordering::SeqCst);
+                while std::time::Instant::now() < deadline && !INTERRUPTED.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                if INTERRUPTED.load(Ordering::SeqCst) {
+                    writeln!(out, "Cancelled; leaving the computer on.")?;
+                } else {
+                    crate::sys::power(when);
+                }
+            }
+        }
+    }
+    Ok(if summary.failed > 0 || summary.cancelled || !summary.mirror_failures.is_empty() { 1 } else { 0 })
 }
