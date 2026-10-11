@@ -45,14 +45,28 @@ pub fn disk_space(path: &Path) -> Option<(u64, u64)> {
     }
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized, writable statvfs.
-    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut st) };
-    if rc != 0 {
-        return None;
+    // macOS: statvfs uses 32-bit block counts, which overflow on big network shares (a 20 TB SMB share
+    // reported as 2.4 TB). statfs has 64-bit counts and is what `df` uses.
+    #[cfg(target_os = "macos")]
+    {
+        let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized, writable statfs.
+        if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let bs = st.f_bsize as u64;
+        Some((st.f_blocks * bs, st.f_bavail * bs))
     }
-    let frsize = st.f_frsize as u64;
-    Some((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized, writable statvfs.
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        let frsize = st.f_frsize as u64;
+        Some((st.f_blocks as u64 * frsize, st.f_bavail as u64 * frsize))
+    }
 }
 
 /// `/Volumes/<name>` for paths on an external volume (macOS), else None.
@@ -85,6 +99,37 @@ pub fn disable_cache(file: &File) {
     }
     #[cfg(not(target_os = "macos"))]
     let _ = file;
+}
+
+fn is_unsupported(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
+        || matches!(e.raw_os_error(), Some(c) if c == libc::ENOTSUP || c == libc::EOPNOTSUPP || c == libc::ENOTTY || c == libc::EINVAL)
+}
+
+/// Push a file's data to stable storage as hard as the filesystem allows.
+/// Local disks: a full flush. Network shares (SMB/NFS) often reject the full-flush request with
+/// "Operation not supported" (os error 45), so fall back to plain fsync, and if even that is
+/// unsupported the server owns durability and we continue; the checksum re-read still runs.
+pub fn flush_best_effort(f: &File) -> std::io::Result<()> {
+    flush_with(
+        f,
+        |f| f.sync_all(),
+        |f| {
+            use std::os::fd::AsRawFd;
+            // SAFETY: valid open fd.
+            if unsafe { libc::fsync(f.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+        },
+    )
+}
+
+fn flush_with(f: &File, full: impl Fn(&File) -> std::io::Result<()>, plain: impl Fn(&File) -> std::io::Result<()>) -> std::io::Result<()> {
+    match full(f) {
+        Err(e) if is_unsupported(&e) => match plain(f) {
+            Err(e2) if is_unsupported(&e2) => Ok(()),
+            other => other,
+        },
+        other => other,
+    }
 }
 
 pub const BUF: usize = 2 * 1024 * 1024;
@@ -144,6 +189,36 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let (total, free) = disk_space(&d.path().join("a/b/c")).unwrap();
         assert!(total > 0 && free <= total);
+    }
+
+    #[test]
+    fn flush_falls_back_on_unsupported_but_reports_real_errors() {
+        let d = tempfile::tempdir().unwrap();
+        let f = File::create(d.path().join("f")).unwrap();
+        let enotsup = || Err(std::io::Error::from_raw_os_error(45));
+        let eio = || Err(std::io::Error::from_raw_os_error(libc::EIO));
+        // full flush unsupported (SMB) -> plain fsync used
+        assert!(flush_with(&f, |_| enotsup(), |_| Ok(())).is_ok());
+        // both unsupported -> tolerated
+        assert!(flush_with(&f, |_| enotsup(), |_| enotsup()).is_ok());
+        // a genuine I/O error is never swallowed
+        assert!(flush_with(&f, |_| eio(), |_| Ok(())).is_err());
+        assert!(flush_with(&f, |_| enotsup(), |_| eio()).is_err());
+        assert!(flush_best_effort(&f).is_ok());
+    }
+
+    #[test]
+    fn disk_space_agrees_with_df() {
+        let d = tempfile::tempdir().unwrap();
+        let (total, free) = disk_space(d.path()).unwrap();
+        let out = std::process::Command::new("df").arg("-k").arg(d.path()).output().unwrap();
+        let line = String::from_utf8_lossy(&out.stdout).lines().last().unwrap().to_string();
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        let df_total: u64 = cols[1].parse::<u64>().unwrap() * 1024;
+        let df_avail: u64 = cols[3].parse::<u64>().unwrap() * 1024;
+        let close = |a: u64, b: u64| (a as i128 - b as i128).unsigned_abs() < (b as u128 / 50 + (64 << 20)); // within 2%
+        assert!(close(total, df_total), "total {total} vs df {df_total}");
+        assert!(close(free, df_avail), "free {free} vs df {df_avail}");
     }
 
     #[test]

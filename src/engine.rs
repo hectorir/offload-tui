@@ -348,7 +348,7 @@ fn copy_stream(src: &Path, part: &Path, ctrl: &Control, mut on_bytes: impl FnMut
 
 fn verify_job(job: &VerifyJob, ctrl: &Control, tx: &Sender<Event>) -> std::result::Result<(), String> {
     // Flush to the physical disk, then re-read bypassing the cache.
-    File::open(&job.part).and_then(|f| f.sync_all()).map_err(|e| format!("flush: {e}"))?;
+    File::open(&job.part).and_then(|f| fsutil::flush_best_effort(&f)).map_err(|e| format!("flush: {e}"))?;
     let index = job.index;
     let (got, len) = fsutil::hash_file(&job.part, true, |b| {
         let _ = tx.send(Event::VerifyProgress { index, bytes: b });
@@ -457,7 +457,7 @@ pub fn run(plan: &Plan, ctrl: &Arc<Control>, tx: Sender<Event>) -> Summary {
 
     // Persist the directory entries of the finalized files.
     if let Ok(d) = File::open(&plan.dest_dir) {
-        let _ = d.sync_all();
+        let _ = fsutil::flush_best_effort(&d);
     }
     finish(tally, start, &tx, &plan.dest_dir)
 }
