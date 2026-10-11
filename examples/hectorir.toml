@@ -1,0 +1,32 @@
+destination = "/Volumes/Old External Drives/0 Photos & My Footage/Needs to Back up"
+date_format = "%Y-%m-%d"
+theme = "catppuccin"
+notify = true
+
+[[profile]]
+name = "DJI Osmo Action"
+subfolder = "DJI"
+sources = [
+    "/Volumes/SD_Card/DCIM/DJI_001",
+    "/Volumes/OsmoAction/DCIM",
+]
+include = [
+    "mp4",
+    "wav",
+]
+exclude = ["lrf"]
+icon = "action"
+
+[[profile]]
+name = "Sony Mirrorless"
+subfolder = "Sony"
+sources = [
+    "/Volumes/Untitled/DCIM",
+    "/Volumes/Untitled/private/M4ROOT/CLIP",
+]
+include = [
+    "mp4",
+    "arw",
+]
+exclude = []
+icon = "mirrorless"

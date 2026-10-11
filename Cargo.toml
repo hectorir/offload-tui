@@ -1,0 +1,40 @@
+[package]
+name = "offload-tui"
+version = "0.1.0"
+edition = "2024"
+description = "A fast, verified camera-card offload tool with a beautiful terminal UI"
+license = "MIT"
+repository = "https://github.com/hectorir/offload-tui"
+readme = "README.md"
+keywords = ["tui", "camera", "backup", "dji", "sony"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lib]
+name = "offload"
+path = "src/lib.rs"
+
+[[bin]]
+name = "offload"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.28"
+dirs = "7.0.0"
+libc = "0.2.190"
+ratatui = "0.29"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,9 @@
+# offload profile pack: GoPro (adjust the volume name to match your card)
+# Import with: offload pack import examples/gopro.pack.toml
+[profile]
+name = "GoPro"
+subfolder = "GoPro"
+sources = ["/Volumes/GoPro/DCIM"]
+include = ["mp4", "jpg", "gpr", "wav"]
+exclude = ["lrv", "thm"]
+icon = "action"

@@ -1,0 +1,341 @@
+#![allow(clippy::field_reassign_with_default)]
+use offload::config::Config;
+use offload::engine::{self, Control, Event, Outcome, Plan, Summary};
+use offload::scan::scan_profile;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+
+struct Rig {
+    _tmp: tempfile::TempDir,
+    cfg: Config,
+    src: PathBuf,
+    dest: PathBuf,
+}
+
+fn rig() -> Rig {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("card/DCIM");
+    let dest = tmp.path().join("backup");
+    fs::create_dir_all(&src).unwrap();
+    let mut cfg = Config::default();
+    cfg.destination = dest.to_string_lossy().into();
+    cfg.profiles[0].sources = vec![src.to_string_lossy().into()];
+    Rig { _tmp: tmp, cfg, src, dest }
+}
+
+fn pattern(len: usize, seed: u8) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+}
+
+fn plan_for(r: &Rig) -> Plan {
+    let p = &r.cfg.profiles[0];
+    let scan = scan_profile(p);
+    let refs: Vec<_> = scan.files.iter().collect();
+    engine::build_plan(&r.cfg, p, &refs, chrono::Local::now()).unwrap()
+}
+
+fn run(plan: &Plan) -> (Summary, Vec<Event>) {
+    let (tx, rx) = mpsc::channel();
+    let ctrl = Control::new();
+    let s = engine::run(plan, &ctrl, tx);
+    (s, rx.try_iter().collect())
+}
+
+fn list(dir: &Path) -> Vec<String> {
+    let mut v: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn copies_filters_and_verifies_everything() {
+    let r = rig();
+    let big = pattern(5 * 1024 * 1024 + 123, 7); // spans several chunks
+    fs::write(r.src.join("clip.MP4"), &big).unwrap();
+    fs::write(r.src.join("audio.wav"), pattern(1000, 1)).unwrap();
+    fs::write(r.src.join("proxy.LRF"), pattern(500, 2)).unwrap();
+    fs::write(r.src.join("photo.jpg"), pattern(500, 3)).unwrap();
+    fs::write(r.src.join("empty.mp4"), b"").unwrap();
+    let plan = plan_for(&r);
+    assert_eq!(plan.items.len(), 3);
+    assert!(plan.dest_dir.ends_with(format!("{}/DJI", chrono::Local::now().format("%Y-%m-%d"))));
+
+    let (s, ev) = run(&plan);
+    assert_eq!((s.copied, s.skipped, s.failed, s.renamed), (3, 0, 0, 0), "{:?}", s.failures);
+    assert!(!s.cancelled);
+    assert_eq!(list(&plan.dest_dir), ["audio.wav", "clip.MP4", "empty.mp4"], "no LRF, no jpg, no .part leftovers");
+    assert_eq!(fs::read(plan.dest_dir.join("clip.MP4")).unwrap(), big);
+    assert_eq!(fs::read(plan.dest_dir.join("empty.mp4")).unwrap().len(), 0);
+
+    // mtime preserved
+    let sm = fs::metadata(r.src.join("clip.MP4")).unwrap().modified().unwrap();
+    let dm = fs::metadata(plan.dest_dir.join("clip.MP4")).unwrap().modified().unwrap();
+    assert_eq!(sm, dm);
+
+    // progress accounting matches the plan exactly
+    let copied: u64 = ev.iter().filter_map(|e| if let Event::Progress { bytes, .. } = e { Some(*bytes) } else { None }).sum();
+    let verified: u64 = ev.iter().filter_map(|e| if let Event::VerifyProgress { bytes, .. } = e { Some(*bytes) } else { None }).sum();
+    assert_eq!(copied, plan.total_bytes());
+    assert_eq!(verified, plan.total_bytes());
+    assert!(matches!(ev.last(), Some(Event::Finished(_))));
+    assert_eq!(ev.iter().filter(|e| matches!(e, Event::Done { .. })).count(), 3);
+}
+
+#[test]
+fn source_files_are_never_modified_or_removed() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(4096, 9)).unwrap();
+    let before = fs::read(r.src.join("a.mp4")).unwrap();
+    let mt = fs::metadata(r.src.join("a.mp4")).unwrap().modified().unwrap();
+    run(&plan_for(&r));
+    assert_eq!(fs::read(r.src.join("a.mp4")).unwrap(), before);
+    assert_eq!(fs::metadata(r.src.join("a.mp4")).unwrap().modified().unwrap(), mt);
+}
+
+#[test]
+fn rerun_skips_identical_files_by_checksum() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(300_000, 1)).unwrap();
+    fs::write(r.src.join("b.wav"), pattern(200_000, 2)).unwrap();
+    let plan = plan_for(&r);
+    let (s1, _) = run(&plan);
+    assert_eq!(s1.copied, 2);
+    let (s2, ev) = run(&plan);
+    assert_eq!((s2.copied, s2.skipped, s2.failed), (0, 2, 0));
+    assert_eq!(list(&plan.dest_dir), ["a.mp4", "b.wav"], "no duplicates created");
+    assert!(ev.iter().any(|e| matches!(e, Event::Done { outcome: Outcome::Skipped { .. }, .. })));
+}
+
+#[test]
+fn same_name_different_content_keeps_both_and_never_overwrites() {
+    let r = rig();
+    fs::write(r.src.join("C0001.MP4"), pattern(10_000, 5)).unwrap();
+    let plan = plan_for(&r);
+    fs::create_dir_all(&plan.dest_dir).unwrap();
+    let precious = pattern(10_000, 99); // same size, different bytes
+    fs::write(plan.dest_dir.join("C0001.MP4"), &precious).unwrap();
+
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.renamed, s.failed), (1, 1, 0));
+    assert_eq!(fs::read(plan.dest_dir.join("C0001.MP4")).unwrap(), precious, "existing file untouched");
+    assert_eq!(fs::read(plan.dest_dir.join("C0001_1.MP4")).unwrap(), pattern(10_000, 5));
+
+    // Running again recognizes the renamed copy as already done.
+    let (s2, _) = run(&plan);
+    assert_eq!((s2.copied, s2.skipped), (0, 1));
+    assert_eq!(list(&plan.dest_dir), ["C0001.MP4", "C0001_1.MP4"]);
+}
+
+#[test]
+fn colliding_names_from_different_folders_both_survive() {
+    let r = rig();
+    fs::create_dir_all(r.src.join("100")).unwrap();
+    fs::create_dir_all(r.src.join("200")).unwrap();
+    fs::create_dir_all(r.src.join("300")).unwrap();
+    fs::write(r.src.join("100/DJI_0001.MP4"), pattern(1000, 1)).unwrap();
+    fs::write(r.src.join("200/DJI_0001.MP4"), pattern(1000, 2)).unwrap();
+    fs::write(r.src.join("300/dji_0001.mp4"), pattern(1000, 3)).unwrap(); // differs only by case
+    let (s, _) = run(&plan_for(&r));
+    assert_eq!((s.copied, s.failed), (3, 0), "{:?}", s.failures);
+    let plan = plan_for(&r);
+    let names = list(&plan.dest_dir);
+    assert_eq!(names.len(), 3);
+    let mut contents: Vec<_> = names.iter().map(|n| fs::read(plan.dest_dir.join(n)).unwrap()).collect();
+    contents.sort();
+    let mut want = vec![pattern(1000, 1), pattern(1000, 2), pattern(1000, 3)];
+    want.sort();
+    assert_eq!(contents, want, "every distinct source file is preserved");
+}
+
+#[test]
+fn stale_part_files_from_a_crash_are_replaced() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(50_000, 4)).unwrap();
+    let plan = plan_for(&r);
+    fs::create_dir_all(&plan.dest_dir).unwrap();
+    fs::write(plan.dest_dir.join(".a.mp4.part"), b"half-written garbage").unwrap();
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.failed), (1, 0));
+    assert_eq!(list(&plan.dest_dir), ["a.mp4"]);
+    assert_eq!(fs::read(plan.dest_dir.join("a.mp4")).unwrap(), pattern(50_000, 4));
+}
+
+#[test]
+fn corrupt_partial_final_file_is_not_trusted() {
+    // A truncated file at the final name (e.g. from another tool) must not be treated as "already copied".
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(50_000, 4)).unwrap();
+    let plan = plan_for(&r);
+    fs::create_dir_all(&plan.dest_dir).unwrap();
+    fs::write(plan.dest_dir.join("a.mp4"), &pattern(50_000, 4)[..30_000]).unwrap();
+    let (s, _) = run(&plan);
+    assert_eq!((s.skipped, s.copied, s.renamed), (0, 1, 1));
+    assert_eq!(fs::read(plan.dest_dir.join("a_1.mp4")).unwrap(), pattern(50_000, 4));
+}
+
+#[test]
+fn cancel_before_start_writes_nothing() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    fs::write(r.src.join("b.mp4"), pattern(1000, 2)).unwrap();
+    let plan = plan_for(&r);
+    let (tx, _rx) = mpsc::channel();
+    let ctrl = Control::new();
+    ctrl.cancel();
+    let s = engine::run(&plan, &ctrl, tx);
+    assert!(s.cancelled);
+    assert_eq!(s.copied, 0);
+    assert!(list(&plan.dest_dir).is_empty());
+}
+
+#[test]
+fn cancel_mid_copy_leaves_no_partial_or_unverified_files() {
+    let r = rig();
+    for i in 0..6u8 {
+        fs::write(r.src.join(format!("f{i}.mp4")), pattern(8 * 1024 * 1024, i)).unwrap();
+    }
+    let plan = plan_for(&r);
+    let (tx, rx) = mpsc::channel();
+    let ctrl = Control::new();
+    let c2 = ctrl.clone();
+    let watcher = std::thread::spawn(move || {
+        let mut n = 0;
+        let mut evs = vec![];
+        while let Ok(e) = rx.recv() {
+            if matches!(e, Event::Progress { .. }) {
+                n += 1;
+                if n == 3 {
+                    c2.cancel();
+                }
+            }
+            let fin = matches!(e, Event::Finished(_));
+            evs.push(e);
+            if fin {
+                break;
+            }
+        }
+        evs
+    });
+    let s = engine::run(&plan, &ctrl, tx);
+    watcher.join().unwrap();
+    assert!(s.cancelled);
+    for name in list(&plan.dest_dir) {
+        assert!(!name.ends_with(".part"), "leftover partial: {name}");
+        // any file that exists under a real name must be complete and correct
+        let i: u8 = name[1..2].parse().unwrap();
+        assert_eq!(fs::read(plan.dest_dir.join(&name)).unwrap(), pattern(8 * 1024 * 1024, i), "{name}");
+    }
+    assert!(s.copied < 6);
+}
+
+#[test]
+fn pause_blocks_progress_until_resumed() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(6 * 1024 * 1024, 1)).unwrap();
+    let plan = plan_for(&r);
+    let (tx, rx) = mpsc::channel();
+    let ctrl = Control::new();
+    ctrl.set_paused(true);
+    let c2 = ctrl.clone();
+    let h = std::thread::spawn(move || engine::run(&plan, &c2, tx));
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    let progressed: u64 = rx.try_iter().filter_map(|e| if let Event::Progress { bytes, .. } = e { Some(bytes) } else { None }).sum();
+    assert_eq!(progressed, 0, "no bytes may move while paused");
+    ctrl.set_paused(false);
+    let s = h.join().unwrap();
+    assert_eq!((s.copied, s.failed), (1, 0));
+}
+
+#[test]
+fn space_guard_and_missing_volume() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    let mut plan = plan_for(&r);
+    assert!(engine::preflight(&plan).is_ok());
+
+    plan.items[0].size = u64::MAX / 4; // absurdly large
+    let err = engine::preflight(&plan).unwrap_err();
+    assert!(err.contains("Not enough space"), "{err}");
+
+    let mut missing = plan_for(&r);
+    missing.dest_dir = PathBuf::from("/Volumes/definitely-not-mounted-zz/Backup/2026-01-01/DJI");
+    let err = engine::preflight(&missing).unwrap_err();
+    assert!(err.contains("not mounted"), "{err}");
+
+    let empty = Plan { dest_dir: plan.dest_dir.clone(), items: vec![] };
+    assert!(engine::preflight(&empty).is_err());
+}
+
+#[test]
+fn unmounted_destination_volume_creates_nothing() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    let mut plan = plan_for(&r);
+    plan.dest_dir = PathBuf::from("/Volumes/definitely-not-mounted-zz/Backup/2026-01-01/DJI");
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.failed), (0, 1));
+    assert!(!Path::new("/Volumes/definitely-not-mounted-zz").exists());
+}
+
+#[test]
+fn refuses_to_write_through_a_symlinked_destination() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    let plan = plan_for(&r);
+    let elsewhere = r._tmp.path().join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    fs::create_dir_all(plan.dest_dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &plan.dest_dir).unwrap();
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.failed), (0, 1));
+    assert!(list(&elsewhere).is_empty(), "nothing may leak through the symlink");
+}
+
+#[test]
+fn symlinked_part_file_is_not_followed() {
+    let r = rig();
+    fs::write(r.src.join("a.mp4"), pattern(1000, 1)).unwrap();
+    let plan = plan_for(&r);
+    fs::create_dir_all(&plan.dest_dir).unwrap();
+    let victim = r._tmp.path().join("victim.txt");
+    fs::write(&victim, b"keep me").unwrap();
+    std::os::unix::fs::symlink(&victim, plan.dest_dir.join(".a.mp4.part")).unwrap();
+    let (s, _) = run(&plan);
+    assert_eq!((s.copied, s.failed), (1, 0));
+    assert_eq!(fs::read(&victim).unwrap(), b"keep me");
+}
+
+#[test]
+fn unreadable_source_fails_only_that_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = rig();
+    fs::write(r.src.join("good.mp4"), pattern(1000, 1)).unwrap();
+    fs::write(r.src.join("bad.mp4"), pattern(1000, 2)).unwrap();
+    let plan = plan_for(&r);
+    fs::set_permissions(r.src.join("bad.mp4"), fs::Permissions::from_mode(0o000)).unwrap();
+    let (s, _) = run(&plan);
+    fs::set_permissions(r.src.join("bad.mp4"), fs::Permissions::from_mode(0o644)).unwrap();
+    if unsafe { libc_geteuid() } == 0 {
+        return; // root ignores permissions
+    }
+    assert_eq!((s.copied, s.failed), (1, 1));
+    assert_eq!(s.failures[0].0, "bad.mp4");
+    assert_eq!(list(&plan.dest_dir), ["good.mp4"]);
+}
+
+unsafe extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
+}
+
+#[test]
+fn custom_date_and_subfolder_layout() {
+    let mut r = rig();
+    r.cfg.date_format = "Shoot %d-%m-%Y".into();
+    r.cfg.profiles[0].subfolder = String::new();
+    fs::write(r.src.join("a.mp4"), pattern(10, 1)).unwrap();
+    let plan = plan_for(&r);
+    let want = r.dest.join(chrono::Local::now().format("Shoot %d-%m-%Y").to_string());
+    assert_eq!(plan.dest_dir, want);
+}

@@ -1,0 +1,470 @@
+#![allow(clippy::field_reassign_with_default)]
+use offload::app::*;
+use offload::config::Config;
+use offload::ui;
+use ratatui::Terminal;
+use ratatui::backend::TestBackend;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+struct Rig {
+    _tmp: tempfile::TempDir,
+    app: App,
+    src: PathBuf,
+    dest: PathBuf,
+    paths: Paths,
+}
+
+fn rig() -> Rig {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("card/DCIM");
+    let src2 = tmp.path().join("card2");
+    let dest = tmp.path().join("backup");
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&src2).unwrap();
+    let mut cfg = Config::default();
+    cfg.destination = dest.to_string_lossy().into();
+    cfg.profiles[0].sources = vec![src.to_string_lossy().into(), src2.to_string_lossy().into(), tmp.path().join("missing-card").to_string_lossy().into()];
+    cfg.profiles[1].sources = vec![tmp.path().join("no-sony").to_string_lossy().into()];
+    let paths = Paths { config: tmp.path().join("cfg/config.toml"), history: tmp.path().join("data/history.jsonl"), state: tmp.path().join("data/state.json") };
+    let mut app = App::new(cfg, paths.clone());
+    app.sys_actions = false;
+    Rig { _tmp: tmp, app, src, dest, paths }
+}
+
+fn key(app: &mut App, c: KeyCode) {
+    app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
+}
+fn chr(app: &mut App, c: char) {
+    key(app, KeyCode::Char(c));
+}
+fn typ(app: &mut App, s: &str) {
+    for c in s.chars() {
+        chr(app, c);
+    }
+}
+
+fn render(app: &mut App, w: u16, h: u16) -> String {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| ui::draw(f, app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn wait_for(app: &mut App, screen: Screen) {
+    let t0 = Instant::now();
+    while app.screen != screen {
+        app.tick();
+        assert!(t0.elapsed() < Duration::from_secs(20), "timed out waiting for {screen:?}, stuck on {:?}", app.screen);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn fill(r: &Rig) {
+    fs::write(r.src.join("DJI_0001.MP4"), vec![1u8; 3_000_000]).unwrap();
+    fs::write(r.src.join("DJI_0002.mp4"), vec![2u8; 2_000_000]).unwrap();
+    fs::write(r.src.join("DJI_0001.LRF"), vec![3u8; 1000]).unwrap();
+    fs::write(r.src.join("audio.WAV"), vec![4u8; 500_000]).unwrap();
+}
+
+#[test]
+fn home_shows_profiles_status_and_destination() {
+    let mut r = rig();
+    let s = render(&mut r.app, 100, 30);
+    assert!(s.contains("DJI Osmo Action"), "{s}");
+    assert!(s.contains("Sony Mirrorless"));
+    assert!(s.contains("partly connected"), "2 of 3 sources present:\n{s}");
+    assert!(s.contains("no card detected"));
+    assert!(s.contains("Backup destination"));
+    assert!(s.contains("not mounted") || s.contains("free of") || s.contains("backup"), "{s}");
+    assert!(s.contains("never: LRF"));
+    assert!(s.contains("╔═╗"), "wordmark");
+}
+
+#[test]
+fn full_flow_home_review_run_summary_with_verified_files() {
+    let mut r = rig();
+    fill(&r);
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Scanning);
+    wait_for(&mut r.app, Screen::Review);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("3 of 3 selected"), "{s}");
+    assert!(s.contains("DJI_0001.MP4") && s.contains("audio.WAV"));
+    assert!(!s.contains(".LRF"), "LRF must never be listed");
+    assert!(s.contains("not found - skipped"), "missing source warning:\n{s}");
+    assert!(s.contains("Ready to copy"));
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Running, "{:?}", r.app.review.as_ref().map(|r| r.error.clone()));
+    let mid = render(&mut r.app, 120, 36);
+    assert!(mid.contains("Throughput") && mid.contains("Files"));
+    wait_for(&mut r.app, Screen::Summary);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("All files copied and verified"), "{s}");
+    assert!(s.contains("3 files"));
+
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let out = r.dest.join(&day).join("DJI");
+    let mut names: Vec<_> = fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["DJI_0001.MP4", "DJI_0002.mp4", "audio.WAV"]);
+    assert_eq!(fs::read(out.join("DJI_0001.MP4")).unwrap(), vec![1u8; 3_000_000]);
+    // history written
+    let hist = offload::history::load(&r.paths.history);
+    assert_eq!(hist.len(), 1);
+    assert_eq!((hist[0].copied, hist[0].failed), (3, 0));
+
+    // stats screen shows it
+    chr(&mut r.app, 's');
+    assert_eq!(r.app.screen, Screen::Stats);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("sessions") && s.contains("DJI Osmo Action"), "{s}");
+    key(&mut r.app, KeyCode::Esc);
+    assert_eq!(r.app.screen, Screen::Summary);
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Home);
+
+    // second run: everything is recognized as already copied
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("3 already on dest"), "{s}");
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+    let (_, sum) = r.app.summary.clone().unwrap();
+    assert_eq!((sum.copied, sum.skipped), (0, 3));
+}
+
+#[test]
+fn review_selection_and_date_filtering() {
+    let mut r = rig();
+    fill(&r);
+    // Backdate one file so there are two shoot dates.
+    let old = std::time::SystemTime::now() - Duration::from_secs(5 * 86400);
+    fs::File::options().write(true).open(r.src.join("audio.WAV")).unwrap().set_modified(old).unwrap();
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+    assert_eq!(r.app.review.as_ref().unwrap().dates.len(), 2);
+
+    chr(&mut r.app, 'a'); // deselect all
+    assert_eq!(r.app.review.as_ref().unwrap().selected_count(), 0);
+    key(&mut r.app, KeyCode::Enter); // nothing selected -> stays, with an error
+    assert_eq!(r.app.screen, Screen::Review);
+    assert!(r.app.review.as_ref().unwrap().error.as_ref().unwrap().contains("Nothing selected"));
+
+    chr(&mut r.app, 'a'); // select all
+    key(&mut r.app, KeyCode::Tab);
+    assert_eq!(r.app.review.as_ref().unwrap().focus, Focus::Dates);
+    chr(&mut r.app, ' '); // first (oldest) date toggled off -> removes the WAV
+    let rv = r.app.review.as_ref().unwrap();
+    assert_eq!(rv.selected_count(), 2);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("[~]") || s.contains("[ ]"), "{s}");
+    chr(&mut r.app, ' '); // toggle back on
+    assert_eq!(r.app.review.as_ref().unwrap().selected_count(), 3);
+
+    key(&mut r.app, KeyCode::Tab);
+    chr(&mut r.app, ' '); // toggle first file off
+    assert_eq!(r.app.review.as_ref().unwrap().selected_count(), 2);
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Summary);
+    assert_eq!(r.app.summary.as_ref().unwrap().1.copied, 2);
+}
+
+#[test]
+fn missing_backup_drive_blocks_start_and_creates_nothing() {
+    let mut r = rig();
+    fill(&r);
+    r.app.cfg.destination = "/Volumes/definitely-not-mounted-zz/Backup".into();
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Review);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("not mounted"), "{s}");
+    assert!(!std::path::Path::new("/Volumes/definitely-not-mounted-zz").exists());
+}
+
+#[test]
+fn cancel_flow_asks_for_confirmation() {
+    let mut r = rig();
+    for i in 0..5 {
+        fs::write(r.src.join(format!("big{i}.mp4")), vec![i as u8; 12_000_000]).unwrap();
+    }
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Running);
+    key(&mut r.app, KeyCode::Esc);
+    assert!(r.app.run.as_ref().unwrap().confirm_cancel);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("Cancel and discard"), "{s}");
+    chr(&mut r.app, 'n'); // keep going
+    assert!(!r.app.run.as_ref().unwrap().confirm_cancel);
+    assert!(!r.app.run.as_ref().unwrap().ctrl.is_cancelled());
+    key(&mut r.app, KeyCode::Esc);
+    chr(&mut r.app, 'y');
+    wait_for(&mut r.app, Screen::Summary);
+    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let out = r.dest.join(day).join("DJI");
+    for e in fs::read_dir(&out).unwrap() {
+        let n = e.unwrap().file_name().to_string_lossy().into_owned();
+        assert!(!n.ends_with(".part"), "leftover {n}");
+    }
+}
+
+#[test]
+fn pause_and_resume() {
+    let mut r = rig();
+    for i in 0..4 {
+        fs::write(r.src.join(format!("b{i}.mp4")), vec![i as u8; 10_000_000]).unwrap();
+    }
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+    key(&mut r.app, KeyCode::Enter);
+    chr(&mut r.app, 'p');
+    assert!(r.app.run.as_ref().unwrap().ctrl.is_paused());
+    assert!(render(&mut r.app, 120, 36).contains("PAUSED"));
+    chr(&mut r.app, 'p');
+    assert!(!r.app.run.as_ref().unwrap().ctrl.is_paused());
+    wait_for(&mut r.app, Screen::Summary);
+    assert_eq!(r.app.summary.as_ref().unwrap().1.copied, 4);
+}
+
+#[test]
+fn settings_editor_edits_saves_and_validates() {
+    let mut r = rig();
+    chr(&mut r.app, 'e');
+    assert_eq!(r.app.screen, Screen::Config);
+    let s = render(&mut r.app, 120, 40);
+    assert!(s.contains("Backup folder") && s.contains("Copy types") && s.contains("Add a profile"), "{s}");
+
+    // edit destination (first row)
+    key(&mut r.app, KeyCode::Enter);
+    assert!(r.app.editor.input.is_some());
+    r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    typ(&mut r.app, "/tmp/new-backup");
+    key(&mut r.app, KeyCode::Enter);
+    assert!(r.app.editor.input.is_none());
+    assert_eq!(r.app.cfg.destination, "/tmp/new-backup");
+    assert_eq!(Config::load(&r.paths.config).unwrap().destination, "/tmp/new-backup", "saved to disk");
+
+    // go to DJI profile's Subfolder: rows = 4 globals, header, name, subfolder
+    r.app.editor.cursor = 6;
+    key(&mut r.app, KeyCode::Enter);
+    r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    typ(&mut r.app, "../../evil");
+    key(&mut r.app, KeyCode::Enter);
+    assert!(r.app.editor.input.is_some(), "invalid input keeps the editor open");
+    assert_eq!(r.app.cfg.profiles[0].subfolder, "DJI", "invalid value must not be applied");
+    assert!(render(&mut r.app, 120, 40).contains("Not saved"));
+    key(&mut r.app, KeyCode::Esc);
+    assert!(r.app.editor.input.is_none());
+
+    // edit include list
+    r.app.editor.cursor = 8;
+    key(&mut r.app, KeyCode::Enter);
+    r.app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    typ(&mut r.app, "MP4, .mov wav");
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.cfg.profiles[0].include, ["mp4", "mov", "wav"]);
+
+    // add then delete a profile
+    let n = r.app.cfg.profiles.len();
+    r.app.editor.cursor = r.app.editor_rows().len() - 1;
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.cfg.profiles.len(), n + 1);
+    chr(&mut r.app, 'd');
+    chr(&mut r.app, 'y');
+    assert_eq!(r.app.cfg.profiles.len(), n);
+
+    // toggle notify
+    r.app.editor.cursor = 2;
+    key(&mut r.app, KeyCode::Enter);
+    assert!(!Config::load(&r.paths.config).unwrap().notify);
+
+    key(&mut r.app, KeyCode::Esc);
+    assert_eq!(r.app.screen, Screen::Home);
+}
+
+#[test]
+fn cannot_delete_last_profile() {
+    let mut r = rig();
+    r.app.cfg.profiles.truncate(1);
+    chr(&mut r.app, 'e');
+    r.app.editor.cursor = 4;
+    chr(&mut r.app, 'd');
+    assert!(r.app.editor.confirm_delete.is_none());
+    assert_eq!(r.app.cfg.profiles.len(), 1);
+}
+
+#[test]
+fn theme_cycles_persists_and_reloads() {
+    let mut r = rig();
+    let start = r.app.theme.name;
+    chr(&mut r.app, 't');
+    assert_ne!(r.app.theme.name, start);
+    let chosen = r.app.theme.name;
+    let app2 = App::new(r.app.cfg.clone(), r.paths.clone());
+    assert_eq!(app2.theme.name, chosen);
+}
+
+#[test]
+fn mouse_click_and_scroll() {
+    let mut r = rig();
+    render(&mut r.app, 100, 30);
+    let (rect, _) = r.app.hits.iter().find(|(_, h)| *h == Hit::Profile(1)).cloned().unwrap();
+    let click = |x, y| MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x, row: y, modifiers: KeyModifiers::NONE };
+    r.app.on_mouse(click(rect.x + 3, rect.y + 2));
+    assert_eq!(r.app.home_sel, 1);
+    r.app.on_mouse(MouseEvent { kind: MouseEventKind::ScrollUp, column: 0, row: 0, modifiers: KeyModifiers::NONE });
+    assert_eq!(r.app.home_sel, 0);
+    // clicking the already-selected profile starts scanning
+    render(&mut r.app, 100, 30);
+    let (rect, _) = r.app.hits.iter().find(|(_, h)| *h == Hit::Profile(0)).cloned().unwrap();
+    r.app.on_mouse(click(rect.x + 3, rect.y + 2));
+    assert_eq!(r.app.screen, Screen::Scanning);
+}
+
+#[test]
+fn every_screen_renders_at_awkward_sizes_without_panicking() {
+    let mut r = rig();
+    fill(&r);
+    let sizes = [(1, 1), (10, 3), (30, 8), (60, 12), (80, 24), (200, 60)];
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    chr(&mut r.app, '?');
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    chr(&mut r.app, '?');
+    chr(&mut r.app, 'e');
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    key(&mut r.app, KeyCode::Esc);
+    chr(&mut r.app, 's');
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    key(&mut r.app, KeyCode::Esc);
+    key(&mut r.app, KeyCode::Enter);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h); // scanning
+    }
+    wait_for(&mut r.app, Screen::Review);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    key(&mut r.app, KeyCode::Enter);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+    wait_for(&mut r.app, Screen::Summary);
+    for (w, h) in sizes {
+        render(&mut r.app, w, h);
+    }
+}
+
+#[test]
+fn hostile_filenames_cannot_inject_escape_sequences() {
+    let mut r = rig();
+    fs::write(r.src.join("evil\x1b[2Jname.mp4"), b"x").unwrap();
+    key(&mut r.app, KeyCode::Enter);
+    wait_for(&mut r.app, Screen::Review);
+    let s = render(&mut r.app, 120, 36);
+    assert!(!s.contains('\x1b'));
+    assert!(s.contains("evil"));
+}
+
+#[test]
+fn ctrl_c_quits() {
+    let mut r = rig();
+    r.app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(r.app.should_quit);
+}
+
+#[test]
+fn number_keys_start_profiles_and_empty_card_shows_hint() {
+    let mut r = rig();
+    chr(&mut r.app, '2'); // Sony: source missing
+    assert_eq!(r.app.screen, Screen::Scanning);
+    wait_for(&mut r.app, Screen::Review);
+    let s = render(&mut r.app, 120, 36);
+    assert!(s.contains("No matching files found"), "{s}");
+    key(&mut r.app, KeyCode::Enter);
+    assert_eq!(r.app.screen, Screen::Review, "nothing to start");
+    key(&mut r.app, KeyCode::Esc);
+    assert_eq!(r.app.screen, Screen::Home);
+    chr(&mut r.app, '9'); // out of range: ignored
+    assert_eq!(r.app.screen, Screen::Home);
+}
+
+/// Renders every screen with stable demo paths (used to produce the README screenshots).
+/// Run: cargo test --test app_flow dump_frames -- --ignored --nocapture
+#[test]
+#[ignore]
+fn dump_frames() {
+    let demo = PathBuf::from("/tmp/offload-demo");
+    let _ = fs::remove_dir_all(&demo);
+    let dji = demo.join("SD_Card/DCIM/DJI_001");
+    let sony_photos = demo.join("Untitled/DCIM/100MSDCF");
+    let sony_clips = demo.join("Untitled/private/M4ROOT/CLIP");
+    for d in [&dji, &demo.join("OsmoAction/DCIM"), &sony_photos, &sony_clips, &demo.join("Backup")] {
+        fs::create_dir_all(d).unwrap();
+    }
+    for i in 0..9 {
+        fs::write(dji.join(format!("DJI_2026100{}_{:04}_D.MP4", 5 + i / 5, i + 1)), vec![i as u8; 30_000_000 + i * 9_000_000]).unwrap();
+    }
+    fs::write(dji.join("DJI_20261005_0001_D.WAV"), vec![4u8; 1_500_000]).unwrap();
+    fs::write(dji.join("DJI_20261005_0001_D.LRF"), vec![4u8; 1_500]).unwrap();
+    for i in 0..4 {
+        fs::write(sony_photos.join(format!("DSC0371{i}.ARW")), vec![9u8; 2_000_000]).unwrap();
+    }
+    fs::write(sony_clips.join("C2546.MP4"), vec![5u8; 20_000_000]).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3 * 86400);
+    fs::File::options().write(true).open(dji.join("DJI_20261005_0001_D.WAV")).unwrap().set_modified(old).unwrap();
+    let mut cfg = Config::default();
+    cfg.destination = demo.join("Backup").to_string_lossy().into();
+    cfg.profiles[0].sources = vec![dji.to_string_lossy().into(), demo.join("OsmoAction/DCIM").to_string_lossy().into()];
+    cfg.profiles[1].sources = vec![demo.join("Untitled/DCIM").to_string_lossy().into(), sony_clips.to_string_lossy().into()];
+    let paths = Paths { config: demo.join("cfg/config.toml"), history: demo.join("data/history.jsonl"), state: demo.join("data/state.json") };
+    let mut app = App::new(cfg, paths);
+    app.sys_actions = false;
+    let r = &mut app;
+    println!("=====HOME\n{}", render(r, 100, 24));
+    key(r, KeyCode::Enter);
+    wait_for(r, Screen::Review);
+    println!("=====REVIEW\n{}", render(r, 118, 28));
+    key(r, KeyCode::Enter);
+    let t0 = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(40));
+        r.tick();
+        if r.screen != Screen::Running || t0.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        if r.run.as_ref().map(|x| x.done_count() >= 3 && x.copy_rate > 0.0).unwrap_or(false) {
+            break;
+        }
+    }
+    println!("=====RUNNING\n{}", render(r, 118, 28));
+    wait_for(r, Screen::Summary);
+    println!("=====SUMMARY\n{}", render(r, 100, 18));
+    chr(r, 's');
+    println!("=====STATS\n{}", render(r, 100, 22));
+    key(r, KeyCode::Esc);
+    key(r, KeyCode::Enter);
+    chr(r, 'e');
+    println!("=====SETTINGS\n{}", render(r, 100, 24));
+}
